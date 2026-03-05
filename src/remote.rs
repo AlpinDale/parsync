@@ -890,28 +890,31 @@ fn try_pubkey_files(session: &Session, user: &str, configured: &[PathBuf]) -> Re
 
 struct ConnectionPool {
     target: ConnectTarget,
-    inner: Mutex<Vec<Connection>>,
+    inner: Mutex<PoolState>,
     condvar: Condvar,
+}
+
+struct PoolState {
+    idle: Vec<Connection>,
+    created: usize,
+    max_size: usize,
 }
 
 impl ConnectionPool {
     fn new(target: ConnectTarget, pool_size: usize) -> Result<Self> {
+        let mut first = Vec::new();
+        // Eagerly open one connection for fast-fail auth/host errors,
+        // then grow lazily as workers request more connections.
+        first.push(Connection::connect(&target)?);
         let pool = Self {
             target,
-            inner: Mutex::new(Vec::new()),
+            inner: Mutex::new(PoolState {
+                idle: first,
+                created: 1,
+                max_size: pool_size.max(1),
+            }),
             condvar: Condvar::new(),
         };
-
-        {
-            let mut locked = pool
-                .inner
-                .lock()
-                .map_err(|_| anyhow!("pool lock poisoned"))?;
-            for _ in 0..pool_size {
-                locked.push(pool.connect_one()?);
-            }
-        }
-
         Ok(pool)
     }
 
@@ -924,17 +927,40 @@ impl ConnectionPool {
             .inner
             .lock()
             .map_err(|_| anyhow!("pool lock poisoned"))?;
-        while locked.is_empty() {
+        loop {
+            if let Some(conn) = locked.idle.pop() {
+                return Ok(PooledConnection {
+                    pool: self,
+                    conn: Some(conn),
+                });
+            }
+
+            if locked.created < locked.max_size {
+                locked.created += 1;
+                drop(locked);
+                let conn = match self.connect_one() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        let mut state = self
+                            .inner
+                            .lock()
+                            .map_err(|_| anyhow!("pool lock poisoned"))?;
+                        state.created = state.created.saturating_sub(1);
+                        self.condvar.notify_one();
+                        return Err(err);
+                    }
+                };
+                return Ok(PooledConnection {
+                    pool: self,
+                    conn: Some(conn),
+                });
+            }
+
             locked = self
                 .condvar
                 .wait(locked)
                 .map_err(|_| anyhow!("pool lock poisoned while waiting"))?;
         }
-        let conn = locked.pop().ok_or_else(|| anyhow!("pool empty"))?;
-        Ok(PooledConnection {
-            pool: self,
-            conn: Some(conn),
-        })
     }
 
     fn checkin(&self, conn: Connection) -> Result<()> {
@@ -942,7 +968,7 @@ impl ConnectionPool {
             .inner
             .lock()
             .map_err(|_| anyhow!("pool lock poisoned"))?;
-        locked.push(conn);
+        locked.idle.push(conn);
         self.condvar.notify_one();
         Ok(())
     }
