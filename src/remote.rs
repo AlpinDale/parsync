@@ -1,6 +1,8 @@
 #[cfg(unix)]
 use std::ffi::OsString;
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     collections::HashSet,
     io::{Read, Seek, SeekFrom, Write},
     net::TcpStream,
@@ -150,6 +152,8 @@ pub trait RemoteClient {
     fn get_xattrs(&self, _relative_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
         Ok(Vec::new())
     }
+
+    fn clear_thread_pins(&self) {}
 }
 
 #[derive(Clone)]
@@ -400,6 +404,41 @@ PY"#;
         );
         self.run_exec_output(&cmd)
     }
+
+    fn pinned_key(&self) -> usize {
+        Arc::as_ptr(&self.pool) as usize
+    }
+
+    fn with_pinned_connection<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        let key = self.pinned_key();
+        PINNED_CONNECTIONS.with(|table| -> Result<T> {
+            let mut table = table.borrow_mut();
+            if let std::collections::hash_map::Entry::Vacant(entry) = table.entry(key) {
+                let conn = self.pool.checkout_owned()?;
+                entry.insert(ThreadPinnedConnection::new(Arc::clone(&self.pool), conn));
+            }
+            let entry = table
+                .get_mut(&key)
+                .ok_or_else(|| anyhow!("missing pinned connection entry"))?;
+            f(entry.conn_mut()?)
+        })
+    }
+
+    fn replace_pinned_connection(&self, conn: Connection) {
+        let key = self.pinned_key();
+        PINNED_CONNECTIONS.with(|table| {
+            if let Some(entry) = table.borrow_mut().get_mut(&key) {
+                entry.replace(conn);
+            }
+        });
+    }
+
+    fn clear_pinned_connection(&self) {
+        let key = self.pinned_key();
+        PINNED_CONNECTIONS.with(|table| {
+            table.borrow_mut().remove(&key);
+        });
+    }
 }
 
 impl RemoteClient for SshRemote {
@@ -429,8 +468,7 @@ impl RemoteClient for SshRemote {
         let mut last_err: Option<anyhow::Error> = None;
 
         for _ in 0..2 {
-            let mut conn = self.pool.checkout()?;
-            match conn.read_range(&full_path, offset, len) {
+            match self.with_pinned_connection(|conn| conn.read_range(&full_path, offset, len)) {
                 Ok(buf) => return Ok(buf),
                 Err(err) => {
                     last_err = Some(err.context(format!(
@@ -441,13 +479,17 @@ impl RemoteClient for SshRemote {
                         self.spec.display_host()
                     )));
                     if let Ok(new_conn) = self.pool.connect_one() {
-                        conn.replace(new_conn);
+                        self.replace_pinned_connection(new_conn);
                     }
                 }
             }
         }
 
         Err(last_err.unwrap_or_else(|| anyhow!("unable to read range")))
+    }
+
+    fn clear_thread_pins(&self) {
+        self.clear_pinned_connection();
     }
 
     fn stat_file(&self, relative_path: &Path) -> Result<RemoteFileStat> {
@@ -580,6 +622,46 @@ struct ConnectTarget {
     port: u16,
     user: String,
     identity_files: Vec<PathBuf>,
+}
+
+thread_local! {
+    static PINNED_CONNECTIONS: RefCell<HashMap<usize, ThreadPinnedConnection>> =
+        RefCell::new(HashMap::new());
+}
+
+struct ThreadPinnedConnection {
+    pool: Arc<ConnectionPool>,
+    conn: Option<Connection>,
+}
+
+impl ThreadPinnedConnection {
+    fn new(pool: Arc<ConnectionPool>, conn: Connection) -> Self {
+        Self {
+            pool,
+            conn: Some(conn),
+        }
+    }
+
+    fn conn_mut(&mut self) -> Result<&mut Connection> {
+        if self.conn.is_none() {
+            self.conn = Some(self.pool.checkout_owned()?);
+        }
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pinned connection"))
+    }
+
+    fn replace(&mut self, conn: Connection) {
+        self.conn = Some(conn);
+    }
+}
+
+impl Drop for ThreadPinnedConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            let _ = self.pool.checkin(conn);
+        }
+    }
 }
 
 fn resolve_connect_target(spec: &RemoteSpec) -> Result<ConnectTarget> {
@@ -971,6 +1053,41 @@ impl ConnectionPool {
         }
     }
 
+    fn checkout_owned(&self) -> Result<Connection> {
+        let mut locked = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow!("pool lock poisoned"))?;
+        loop {
+            if let Some(conn) = locked.idle.pop() {
+                return Ok(conn);
+            }
+
+            if locked.created < locked.max_size {
+                locked.created += 1;
+                drop(locked);
+                let conn = match self.connect_one() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        let mut state = self
+                            .inner
+                            .lock()
+                            .map_err(|_| anyhow!("pool lock poisoned"))?;
+                        state.created = state.created.saturating_sub(1);
+                        self.condvar.notify_one();
+                        return Err(err);
+                    }
+                };
+                return Ok(conn);
+            }
+
+            locked = self
+                .condvar
+                .wait(locked)
+                .map_err(|_| anyhow!("pool lock poisoned while waiting"))?;
+        }
+    }
+
     fn checkin(&self, conn: Connection) -> Result<()> {
         let mut locked = self
             .inner
@@ -988,10 +1105,6 @@ struct PooledConnection<'a> {
 }
 
 impl<'a> PooledConnection<'a> {
-    fn replace(&mut self, conn: Connection) {
-        self.conn = Some(conn);
-    }
-
     fn readdir(&mut self, path: &Path) -> Result<Vec<(PathBuf, FileStat)>> {
         self.conn
             .as_mut()
@@ -1012,14 +1125,6 @@ impl<'a> PooledConnection<'a> {
             .ok_or_else(|| anyhow!("missing pooled connection"))?
             .readlink(path)
     }
-
-    fn read_range(&mut self, path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
-        self.conn
-            .as_mut()
-            .ok_or_else(|| anyhow!("missing pooled connection"))?
-            .read_range(path, offset, len)
-    }
-
     fn exec(&mut self, cmd: &str) -> Result<ExecOutput> {
         self.conn
             .as_mut()

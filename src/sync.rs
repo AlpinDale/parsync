@@ -151,6 +151,14 @@ struct PerfCounters {
     state_commit_ms: AtomicU64,
 }
 
+struct ThreadPinGuard<'a, R: RemoteClient + Sync>(&'a R);
+
+impl<R: RemoteClient + Sync> Drop for ThreadPinGuard<'_, R> {
+    fn drop(&mut self) {
+        self.0.clear_thread_pins();
+    }
+}
+
 pub fn run_sync(cli: Cli) -> Result<RunSummary> {
     let options = SyncOptions::from_cli(&cli)?;
     log_debug(
@@ -588,6 +596,7 @@ fn transfer_one<R: RemoteClient + Sync>(
 
     for change_retry in 0..2 {
         check_interrupted()?;
+        let _pin_guard = ThreadPinGuard(remote);
         let chunk_size = if job.entry.size >= options.chunk_threshold {
             options.chunk_size.min(options.sftp_read_chunk_size).max(1)
         } else {
