@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use ssh2::{FileStat, Session, Sftp};
+use ssh2::{File, FileStat, Session, Sftp};
 
 use crate::delta::protocol::{BlockSigWire, DeltaPlan, HelperRequest, HelperResponse};
 
@@ -616,6 +616,8 @@ fn resolve_connect_target(spec: &RemoteSpec) -> Result<ConnectTarget> {
 struct Connection {
     session: Session,
     sftp: Sftp,
+    open_read_path: Option<PathBuf>,
+    open_read_file: Option<File>,
 }
 
 struct ExecOutput {
@@ -638,7 +640,12 @@ impl Connection {
 
         authenticate_session(&session, target)?;
         let sftp = session.sftp().context("create sftp session")?;
-        Ok(Self { session, sftp })
+        Ok(Self {
+            session,
+            sftp,
+            open_read_path: None,
+            open_read_file: None,
+        })
     }
 
     fn readdir(&mut self, path: &Path) -> Result<Vec<(PathBuf, FileStat)>> {
@@ -660,10 +667,25 @@ impl Connection {
     }
 
     fn read_range(&mut self, path: &Path, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let mut file = self
-            .sftp
-            .open(path)
-            .with_context(|| format!("sftp open failed: {}", path.display()))?;
+        let needs_open = self
+            .open_read_path
+            .as_ref()
+            .map(|p| p != path)
+            .unwrap_or(true)
+            || self.open_read_file.is_none();
+        if needs_open {
+            self.open_read_file = Some(
+                self.sftp
+                    .open(path)
+                    .with_context(|| format!("sftp open failed: {}", path.display()))?,
+            );
+            self.open_read_path = Some(path.to_path_buf());
+        }
+
+        let file = self
+            .open_read_file
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing open sftp file handle"))?;
         file.seek(SeekFrom::Start(offset))
             .with_context(|| format!("sftp seek failed: {}", path.display()))?;
 
@@ -795,6 +817,14 @@ impl Connection {
     }
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Keep shutdown snappy; transfer-time timeout remains higher.
+        self.session.set_timeout(150);
+        let _ = self.session.disconnect(None, "prsync shutdown", None);
+    }
+}
+
 fn authenticate_session(session: &Session, target: &ConnectTarget) -> Result<()> {
     if session.userauth_agent(&target.user).is_ok() && session.authenticated() {
         return Ok(());
@@ -868,28 +898,31 @@ fn try_pubkey_files(session: &Session, user: &str, configured: &[PathBuf]) -> Re
 
 struct ConnectionPool {
     target: ConnectTarget,
-    inner: Mutex<Vec<Connection>>,
+    inner: Mutex<PoolState>,
     condvar: Condvar,
+}
+
+struct PoolState {
+    idle: Vec<Connection>,
+    created: usize,
+    max_size: usize,
 }
 
 impl ConnectionPool {
     fn new(target: ConnectTarget, pool_size: usize) -> Result<Self> {
+        let mut first = Vec::new();
+        // Eagerly open one connection for fast-fail auth/host errors,
+        // then grow lazily as workers request more connections.
+        first.push(Connection::connect(&target)?);
         let pool = Self {
             target,
-            inner: Mutex::new(Vec::new()),
+            inner: Mutex::new(PoolState {
+                idle: first,
+                created: 1,
+                max_size: pool_size.max(1),
+            }),
             condvar: Condvar::new(),
         };
-
-        {
-            let mut locked = pool
-                .inner
-                .lock()
-                .map_err(|_| anyhow!("pool lock poisoned"))?;
-            for _ in 0..pool_size {
-                locked.push(pool.connect_one()?);
-            }
-        }
-
         Ok(pool)
     }
 
@@ -902,17 +935,40 @@ impl ConnectionPool {
             .inner
             .lock()
             .map_err(|_| anyhow!("pool lock poisoned"))?;
-        while locked.is_empty() {
+        loop {
+            if let Some(conn) = locked.idle.pop() {
+                return Ok(PooledConnection {
+                    pool: self,
+                    conn: Some(conn),
+                });
+            }
+
+            if locked.created < locked.max_size {
+                locked.created += 1;
+                drop(locked);
+                let conn = match self.connect_one() {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        let mut state = self
+                            .inner
+                            .lock()
+                            .map_err(|_| anyhow!("pool lock poisoned"))?;
+                        state.created = state.created.saturating_sub(1);
+                        self.condvar.notify_one();
+                        return Err(err);
+                    }
+                };
+                return Ok(PooledConnection {
+                    pool: self,
+                    conn: Some(conn),
+                });
+            }
+
             locked = self
                 .condvar
                 .wait(locked)
                 .map_err(|_| anyhow!("pool lock poisoned while waiting"))?;
         }
-        let conn = locked.pop().ok_or_else(|| anyhow!("pool empty"))?;
-        Ok(PooledConnection {
-            pool: self,
-            conn: Some(conn),
-        })
     }
 
     fn checkin(&self, conn: Connection) -> Result<()> {
@@ -920,7 +976,7 @@ impl ConnectionPool {
             .inner
             .lock()
             .map_err(|_| anyhow!("pool lock poisoned"))?;
-        locked.push(conn);
+        locked.idle.push(conn);
         self.condvar.notify_one();
         Ok(())
     }
