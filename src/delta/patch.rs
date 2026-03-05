@@ -1,10 +1,6 @@
-use std::{
-    fs::File,
-    io::Write,
-    path::Path,
-};
 #[cfg(not(unix))]
 use std::io::Read;
+use std::{fs::File, io::Write, path::Path};
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};

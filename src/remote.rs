@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::{
     collections::HashSet,
     io::{Read, Seek, SeekFrom, Write},
@@ -5,8 +7,6 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
 };
-#[cfg(unix)]
-use std::ffi::OsString;
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
