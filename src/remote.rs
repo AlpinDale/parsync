@@ -910,10 +910,9 @@ struct PoolState {
 
 impl ConnectionPool {
     fn new(target: ConnectTarget, pool_size: usize) -> Result<Self> {
-        let mut first = Vec::new();
         // Eagerly open one connection for fast-fail auth/host errors,
         // then grow lazily as workers request more connections.
-        first.push(Connection::connect(&target)?);
+        let first = vec![Connection::connect(&target)?];
         let pool = Self {
             target,
             inner: Mutex::new(PoolState {
