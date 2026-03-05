@@ -39,7 +39,7 @@ Reading the hostname from SSH config is also supported.
 - Resume state is stored in `/local/destination/.prsync/state.db`
 - Active run lock is `/local/destination/.prsync/lock`
 
-## Performance knobs
+## Performance tuning
 
 ```bash
 prsync -vrPlu --jobs 16 --chunk-size 16777216 --chunk-threshold 134217728 user@host:/src /dst
