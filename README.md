@@ -81,6 +81,7 @@ Remote helper deployment:
 - Optional config file: `~/.config/prsync/config.toml`
 - Supported keys: `jobs`, `chunk_size`, `chunk_threshold`, `retries`, `resume`, `state_dir`, `delta_enabled`, `delta_min_size`, `delta_block_size`, `delta_max_literals`, `delta_helper`, `delta_fallback`, `strict_durability`, `verify_existing`, `sftp_read_concurrency`, `sftp_read_chunk_size`
 - Environment overrides: `PRSYNC_JOBS`, `PRSYNC_CHUNK_SIZE`, `PRSYNC_CHUNK_THRESHOLD`, `PRSYNC_RETRIES`, `PRSYNC_RESUME`, `PRSYNC_STATE_DIR`, `PRSYNC_DELTA`, `PRSYNC_DELTA_MIN_SIZE`, `PRSYNC_DELTA_BLOCK_SIZE`, `PRSYNC_DELTA_MAX_LITERALS`, `PRSYNC_DELTA_HELPER`, `PRSYNC_DELTA_FALLBACK`, `PRSYNC_STRICT_DURABILITY`, `PRSYNC_VERIFY_EXISTING`, `PRSYNC_SFTP_READ_CONCURRENCY`, `PRSYNC_SFTP_READ_CHUNK_SIZE`
+
 The order of precedence is CLI > env > config file > built-in defaults.
 
 You can override state location explicitly:

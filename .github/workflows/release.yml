@@ -58,7 +58,7 @@ jobs:
               apt-get update
               apt-get install -y ca-certificates curl build-essential pkg-config libssl-dev git xz-utils
               curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
-              . "$HOME/.cargo/env"
+              . "$CARGO_HOME/env"
               rustup target add "${{ matrix.target }}"
               cargo build --release --locked --target "${{ matrix.target }}"
             '
