@@ -20,9 +20,10 @@ use rayon::prelude::*;
 use crate::{
     cli::Cli,
     config::ResolvedConfig,
+    delta::{apply_delta_ops, build_signature, choose_block_size, strong_hash128, BlockSig},
     hashing::{format_digest, hash_file},
     remote::{EntryKind, RemoteClient, RemoteEntry, RemoteSpec, SshRemote},
-    state::{acquire_destination_lock, StateStore},
+    state::{acquire_destination_lock, DeltaSessionState, StateStore},
 };
 
 #[derive(Debug, Clone)]
@@ -31,6 +32,9 @@ pub struct RunSummary {
     pub skipped_files: u64,
     pub transferred_bytes: u64,
     pub verbose: bool,
+    pub delta_files: u64,
+    pub delta_fallback_files: u64,
+    pub bytes_saved: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +56,12 @@ pub struct SyncOptions {
     pub resume: bool,
     pub dry_run: bool,
     pub state_root: Option<PathBuf>,
+    pub delta_enabled: bool,
+    pub delta_min_size: u64,
+    pub delta_block_size: Option<u32>,
+    pub delta_max_literals: u64,
+    pub delta_helper: String,
+    pub delta_fallback: bool,
 }
 
 impl SyncOptions {
@@ -75,6 +85,12 @@ impl SyncOptions {
             resume: resolved.resume,
             dry_run: cli.dry_run,
             state_root: resolved.state_dir,
+            delta_enabled: resolved.delta_enabled,
+            delta_min_size: resolved.delta_min_size,
+            delta_block_size: resolved.delta_block_size,
+            delta_max_literals: resolved.delta_max_literals,
+            delta_helper: resolved.delta_helper,
+            delta_fallback: resolved.delta_fallback,
         })
     }
 }
@@ -83,6 +99,13 @@ impl SyncOptions {
 struct FileJob {
     entry: RemoteEntry,
     destination: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TransferOutcome {
+    used_delta: bool,
+    delta_fallback: bool,
+    bytes_saved: u64,
 }
 
 pub fn run_sync(cli: Cli) -> Result<RunSummary> {
@@ -162,6 +185,8 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     let mut dir_count = 0_u64;
     let mut symlink_count = 0_u64;
     let mut file_count = 0_u64;
+    let mut delta_eligible = 0_u64;
+    let mut delta_planned = 0_u64;
     let mut skipped = 0_u64;
 
     for entry in entries {
@@ -195,8 +220,17 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
             }
             EntryKind::File => {
                 file_count += 1;
+                let delta_this_file = options.delta_enabled
+                    && entry.size >= options.delta_min_size
+                    && destination.exists();
+                if delta_this_file {
+                    delta_eligible += 1;
+                }
                 let should_transfer = should_transfer(&destination, &entry, options, &state)?;
                 if should_transfer {
+                    if delta_this_file {
+                        delta_planned += 1;
+                    }
                     jobs.push(FileJob { entry, destination });
                 } else {
                     if !options.dry_run && should_apply_file_metadata(options) {
@@ -222,12 +256,17 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
         queued: jobs.len() as u64,
         skipped,
         queued_bytes: total_bytes,
+        delta_eligible,
+        delta_planned,
     };
     print_plan_summary(options, &plan_summary);
     let ui = Arc::new(TransferUi::new(jobs.len() as u64, total_bytes, options));
 
     let transferred_files = AtomicU64::new(0);
     let transferred_bytes = AtomicU64::new(0);
+    let delta_files = AtomicU64::new(0);
+    let delta_fallback_files = AtomicU64::new(0);
+    let bytes_saved = AtomicU64::new(0);
     let errors: Arc<Mutex<Vec<anyhow::Error>>> = Arc::new(Mutex::new(Vec::new()));
 
     let pool = rayon::ThreadPoolBuilder::new()
@@ -247,18 +286,31 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
                 return;
             }
 
-            if let Err(err) = transfer_one(remote, job, options, &state, &ui) {
-                let mut lock = errors.lock().expect("error lock");
-                lock.push(err.context(format!(
-                    "failed transfer: {}",
-                    job.entry.relative_path.display()
-                )));
-                return;
-            }
+            let outcome = match transfer_one(remote, job, options, &state, &ui) {
+                Ok(v) => v,
+                Err(err) => {
+                    let mut lock = errors.lock().expect("error lock");
+                    lock.push(err.context(format!(
+                        "failed transfer: {}",
+                        job.entry.relative_path.display()
+                    )));
+                    return;
+                }
+            };
 
             transferred_files.fetch_add(1, Ordering::Relaxed);
             transferred_bytes.fetch_add(job.entry.size, Ordering::Relaxed);
-            ui.finish_file(&job.entry.relative_path);
+            if outcome.used_delta {
+                delta_files.fetch_add(1, Ordering::Relaxed);
+                bytes_saved.fetch_add(outcome.bytes_saved, Ordering::Relaxed);
+            }
+            if outcome.delta_fallback {
+                delta_fallback_files.fetch_add(1, Ordering::Relaxed);
+            }
+            ui.finish_file(
+                &job.entry.relative_path,
+                if outcome.used_delta { "delta" } else { "full" },
+            );
         });
     });
 
@@ -273,6 +325,9 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
         skipped_files: skipped,
         transferred_bytes: transferred_bytes.load(Ordering::Relaxed),
         verbose: options.verbose,
+        delta_files: delta_files.load(Ordering::Relaxed),
+        delta_fallback_files: delta_fallback_files.load(Ordering::Relaxed),
+        bytes_saved: bytes_saved.load(Ordering::Relaxed),
     })
 }
 
@@ -324,7 +379,7 @@ fn transfer_one<R: RemoteClient + Sync>(
     options: &SyncOptions,
     state: &Arc<Mutex<StateStore>>,
     ui: &Arc<TransferUi>,
-) -> Result<()> {
+) -> Result<TransferOutcome> {
     vlog(
         options,
         format!(
@@ -335,6 +390,32 @@ fn transfer_one<R: RemoteClient + Sync>(
     );
     if let Some(parent) = job.destination.parent() {
         fs::create_dir_all(parent)?;
+    }
+
+    let mut delta_fallbacked = false;
+    if options.delta_enabled
+        && job.entry.size >= options.delta_min_size
+        && job.destination.exists()
+        && !options.dry_run
+    {
+        match transfer_one_delta(remote, job, options, state, ui) {
+            Ok(outcome) => return Ok(outcome),
+            Err(err) => {
+                if options.delta_fallback {
+                    delta_fallbacked = true;
+                    vlog(
+                        options,
+                        format!(
+                            "delta fallback to full transfer for {}: {}",
+                            job.entry.relative_path.display(),
+                            err
+                        ),
+                    );
+                } else {
+                    return Err(err);
+                }
+            }
+        }
     }
 
     for change_retry in 0..2 {
@@ -479,10 +560,148 @@ fn transfer_one<R: RemoteClient + Sync>(
             options,
             format!("transfer complete: {}", job.entry.relative_path.display()),
         );
-        return Ok(());
+        return Ok(TransferOutcome {
+            used_delta: false,
+            delta_fallback: delta_fallbacked,
+            bytes_saved: 0,
+        });
     }
 
     bail!("unexpected transfer retry exhaustion")
+}
+
+fn transfer_one_delta<R: RemoteClient + Sync>(
+    remote: &R,
+    job: &FileJob,
+    options: &SyncOptions,
+    state: &Arc<Mutex<StateStore>>,
+    ui: &Arc<TransferUi>,
+) -> Result<TransferOutcome> {
+    let basis_path = &job.destination;
+    let block_size = choose_block_size(job.entry.size, options.delta_block_size);
+    let sig = build_signature(basis_path, block_size)?;
+    if sig.blocks.is_empty() {
+        bail!("delta basis signature is empty");
+    }
+    let basis_digest_hex = format_digest(hash_file(basis_path)?);
+    let wire_blocks: Vec<crate::delta::protocol::BlockSigWire> = sig
+        .blocks
+        .iter()
+        .map(|b: &BlockSig| crate::delta::protocol::BlockSigWire {
+            index: b.index,
+            len: b.len,
+            weak: b.weak,
+            strong_hex: format!("{:032x}", b.strong),
+        })
+        .collect();
+
+    {
+        let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+        locked.upsert_delta_session(
+            &job.entry.relative_path,
+            &basis_digest_hex,
+            job.entry.size,
+            job.entry.mtime_secs,
+            block_size,
+        )?;
+        locked.save()?;
+    }
+
+    let plan = remote.generate_delta_plan(
+        &job.entry.relative_path,
+        job.entry.size,
+        job.entry.mtime_secs,
+        block_size,
+        &wire_blocks,
+        &options.delta_helper,
+    )?;
+
+    if plan.literal_bytes > options.delta_max_literals {
+        bail!(
+            "delta literal threshold exceeded ({} > {})",
+            plan.literal_bytes,
+            options.delta_max_literals
+        );
+    }
+    if plan.source_size != job.entry.size || plan.source_mtime_secs != job.entry.mtime_secs {
+        bail!("remote changed during delta planning");
+    }
+
+    let part_path = {
+        let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+        locked.part_path_for(&job.entry.relative_path)
+    };
+
+    let start_idx = {
+        let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+        let maybe = locked.delta_session(&job.entry.relative_path)?;
+        match maybe {
+            Some(DeltaSessionState {
+                basis_digest_hex: d,
+                source_size,
+                source_mtime_secs,
+                block_size: bs,
+                finished: false,
+                last_op_index,
+                ..
+            }) if d == basis_digest_hex
+                && source_size == job.entry.size
+                && source_mtime_secs == job.entry.mtime_secs
+                && bs == block_size =>
+            {
+                last_op_index as usize
+            }
+            _ => 0,
+        }
+    };
+
+    let (written, last_op) =
+        apply_delta_ops(basis_path, &part_path, &plan.ops, block_size, start_idx)?;
+    {
+        let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+        locked.mark_delta_op_progress(&job.entry.relative_path, last_op as u64)?;
+        locked.save()?;
+    }
+    ui.inc_chunk_bytes(written);
+
+    let digest = format!("{:032x}", strong_hash128(&fs::read(&part_path)?));
+    if digest != plan.final_digest_hex {
+        let _ = fs::remove_file(&part_path);
+        let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+        locked.clear_delta_session(&job.entry.relative_path)?;
+        locked.save()?;
+        bail!("delta final digest mismatch");
+    }
+
+    fs::rename(&part_path, &job.destination).with_context(|| {
+        format!(
+            "rename delta partial to destination: {} -> {}",
+            part_path.display(),
+            job.destination.display()
+        )
+    })?;
+    apply_mtime(&job.destination, job.entry.mtime_secs)?;
+    apply_metadata(
+        remote,
+        &job.entry.relative_path,
+        &job.destination,
+        &job.entry,
+        options,
+    )?;
+
+    let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+    locked.mark_delta_finished(&job.entry.relative_path)?;
+    locked.mark_finished_with_digest(
+        &job.entry.relative_path,
+        format_digest(hash_file(&job.destination)?),
+    )?;
+    locked.save()?;
+
+    Ok(TransferOutcome {
+        used_delta: true,
+        delta_fallback: false,
+        bytes_saved: plan.copy_bytes,
+    })
 }
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -587,11 +806,13 @@ struct PlanSummary {
     queued: u64,
     skipped: u64,
     queued_bytes: u64,
+    delta_eligible: u64,
+    delta_planned: u64,
 }
 
 fn print_plan_summary(options: &SyncOptions, summary: &PlanSummary) {
     let summary = format!(
-        "Plan: entries={total_entries} files={files} dirs={dirs} symlinks={symlinks} queued={queued} skipped={skipped} data={}",
+        "Plan: entries={total_entries} files={files} dirs={dirs} symlinks={symlinks} queued={queued} skipped={skipped} delta_eligible={delta_eligible} delta_planned={delta_planned} data={}",
         format_bytes_human(summary.queued_bytes),
         total_entries = summary.total_entries,
         files = summary.files,
@@ -599,6 +820,8 @@ fn print_plan_summary(options: &SyncOptions, summary: &PlanSummary) {
         symlinks = summary.symlinks,
         queued = summary.queued,
         skipped = summary.skipped,
+        delta_eligible = summary.delta_eligible,
+        delta_planned = summary.delta_planned,
     );
     if options.progress || options.verbose {
         eprintln!("[prsync] {summary}");
@@ -705,14 +928,15 @@ impl TransferUi {
         }
     }
 
-    fn finish_file(&self, path: &Path) {
+    fn finish_file(&self, path: &Path, mode: &str) {
         self.transferred_files.fetch_add(1, Ordering::Relaxed);
         let truncated = truncate_for_terminal(&path.display().to_string(), 96);
         if let Ok(mut last) = self.last_path.lock() {
-            *last = Some(truncated.clone());
+            *last = Some(format!("{truncated} [mode={mode}]"));
         }
         if self.show_bars {
-            self.file_line.set_message(format!("last: {truncated}"));
+            self.file_line
+                .set_message(format!("last: {truncated} [mode={mode}]"));
         }
         if self.show_bars {
             self.refresh_message();
@@ -964,7 +1188,10 @@ mod tests {
     use anyhow::{anyhow, Result};
     use tempfile::TempDir;
 
-    use crate::remote::{EntryKind, RemoteClient, RemoteEntry, RemoteFileStat};
+    use crate::{
+        delta::protocol::{BlockSigWire, DeltaOp, DeltaPlan},
+        remote::{EntryKind, RemoteClient, RemoteEntry, RemoteFileStat},
+    };
 
     use super::{run_sync_with_client, SyncOptions};
 
@@ -1056,6 +1283,33 @@ mod tests {
                 mtime_secs: mtime,
             })
         }
+
+        fn generate_delta_plan(
+            &self,
+            relative_path: &Path,
+            source_size: u64,
+            source_mtime_secs: i64,
+            _block_size: u32,
+            _blocks: &[BlockSigWire],
+            _helper_command: &str,
+        ) -> Result<DeltaPlan> {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            let data = self
+                .files
+                .get(relative_path)
+                .ok_or_else(|| anyhow!("missing file"))?;
+            let digest = format!("{:032x}", crate::delta::strong_hash128(data));
+            Ok(DeltaPlan {
+                ops: vec![DeltaOp::Literal {
+                    data_b64: STANDARD.encode(data),
+                }],
+                final_digest_hex: digest,
+                literal_bytes: source_size,
+                copy_bytes: 0,
+                source_size,
+                source_mtime_secs,
+            })
+        }
     }
 
     fn opts() -> SyncOptions {
@@ -1077,6 +1331,12 @@ mod tests {
             resume: true,
             dry_run: false,
             state_root: None,
+            delta_enabled: false,
+            delta_min_size: 8 * 1024 * 1024,
+            delta_block_size: None,
+            delta_max_literals: 64 * 1024 * 1024,
+            delta_helper: "prsync --internal-remote-helper".to_string(),
+            delta_fallback: true,
         }
     }
 
@@ -1104,6 +1364,35 @@ mod tests {
             fs::read(dir.path().join("a.txt")).expect("read"),
             b"hello world"
         );
+    }
+
+    #[test]
+    fn delta_transfer_path_is_used_when_enabled() {
+        let dir = TempDir::new().expect("tmp");
+        let target = dir.path().join("d.bin");
+        fs::write(&target, b"aaaaaaaaaaaaaaa").expect("seed basis");
+
+        let entry = RemoteEntry {
+            relative_path: PathBuf::from("d.bin"),
+            kind: EntryKind::File,
+            size: 15,
+            mtime_secs: 1_700_000_100,
+            mode: 0o644,
+            uid: None,
+            gid: None,
+            link_target: None,
+        };
+        let mut files = BTreeMap::new();
+        files.insert(PathBuf::from("d.bin"), b"bbbbbbbbbbbbbbb".to_vec());
+        let remote = MockRemote::new(vec![entry], files);
+
+        let mut options = opts();
+        options.delta_enabled = true;
+        options.delta_min_size = 1;
+
+        let summary = run_sync_with_client(&remote, dir.path(), &options).expect("sync");
+        assert_eq!(summary.delta_files, 1);
+        assert_eq!(fs::read(target).expect("read"), b"bbbbbbbbbbbbbbb");
     }
 
     #[test]

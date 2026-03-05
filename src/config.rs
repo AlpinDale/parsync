@@ -13,6 +13,12 @@ pub struct ResolvedConfig {
     pub retries: usize,
     pub resume: bool,
     pub state_dir: Option<PathBuf>,
+    pub delta_enabled: bool,
+    pub delta_min_size: u64,
+    pub delta_block_size: Option<u32>,
+    pub delta_max_literals: u64,
+    pub delta_helper: String,
+    pub delta_fallback: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -23,6 +29,12 @@ struct FileConfig {
     retries: Option<usize>,
     resume: Option<bool>,
     state_dir: Option<PathBuf>,
+    delta_enabled: Option<bool>,
+    delta_min_size: Option<u64>,
+    delta_block_size: Option<u32>,
+    delta_max_literals: Option<u64>,
+    delta_helper: Option<String>,
+    delta_fallback: Option<bool>,
 }
 
 impl ResolvedConfig {
@@ -73,6 +85,42 @@ impl ResolvedConfig {
             .or_else(|| std::env::var("PRSYNC_STATE_DIR").ok().map(PathBuf::from))
             .or(file_cfg.state_dir);
 
+        let delta_enabled = if cli.delta {
+            true
+        } else {
+            env_parse::<bool>("PRSYNC_DELTA")
+                .or(file_cfg.delta_enabled)
+                .unwrap_or(false)
+        };
+        let delta_min_size = cli
+            .delta_min_size
+            .or_else(|| env_parse::<u64>("PRSYNC_DELTA_MIN_SIZE"))
+            .or(file_cfg.delta_min_size)
+            .unwrap_or(8 * 1024 * 1024)
+            .max(1);
+        let delta_block_size = cli
+            .delta_block_size
+            .or_else(|| env_parse::<u32>("PRSYNC_DELTA_BLOCK_SIZE"))
+            .or(file_cfg.delta_block_size);
+        let delta_max_literals = cli
+            .delta_max_literals
+            .or_else(|| env_parse::<u64>("PRSYNC_DELTA_MAX_LITERALS"))
+            .or(file_cfg.delta_max_literals)
+            .unwrap_or(64 * 1024 * 1024);
+        let delta_helper = cli
+            .delta_helper
+            .clone()
+            .or_else(|| std::env::var("PRSYNC_DELTA_HELPER").ok())
+            .or(file_cfg.delta_helper)
+            .unwrap_or_else(|| "prsync --internal-remote-helper".to_string());
+        let delta_fallback = if cli.no_delta_fallback {
+            false
+        } else {
+            env_parse::<bool>("PRSYNC_DELTA_FALLBACK")
+                .or(file_cfg.delta_fallback)
+                .unwrap_or(true)
+        };
+
         Ok(Self {
             jobs,
             chunk_size,
@@ -80,6 +128,12 @@ impl ResolvedConfig {
             retries,
             resume,
             state_dir,
+            delta_enabled,
+            delta_min_size,
+            delta_block_size,
+            delta_max_literals,
+            delta_helper,
+            delta_fallback,
         })
     }
 }

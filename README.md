@@ -1,13 +1,18 @@
 # prsync
 
-`prsync` is a Rust CLI for high-throughput, resumable pull syncs from SSH remotes.
+`prsync` is a high-throughput, resumable pull syncs from SSH remotes. In
+essence, a parallelized `rsync` implementation.
 
-## Goals
+## Building
 
-- Parallel transfers across files
-- Chunked resume for large files
-- Automatic resume on rerun (aria2-style)
-- Practical compatibility with common `rsync -vrPlu` workflows
+Make sure you have Rust stable installed (via rustup), then:
+
+```bash
+make build
+make install
+```
+
+At the moment, only Linux and macOS are supported.
 
 ## Usage
 
@@ -20,6 +25,8 @@ To specify a non-default SSH port:
 ```bash
 prsync -vrPlu user@example.com:2222:/remote/path /local/destination
 ```
+
+Reading the hostname from SSH config is also supported.
 
 ## Key behavior
 
@@ -38,12 +45,35 @@ prsync -vrPlu user@example.com:2222:/remote/path /local/destination
 prsync -vrPlu --jobs 16 --chunk-size 16777216 --chunk-threshold 134217728 user@host:/src /dst
 ```
 
+## Delta mode (opt-in)
+
+Enable rsync-class block deltas for large changed files:
+
+```bash
+prsync -vrPlu --delta --delta-min-size 8388608 user@host:/src /dst
+```
+
+Delta flags:
+
+- `--delta`: enable delta transfer
+- `--delta-min-size`: minimum file size eligible for deltas
+- `--delta-block-size`: fixed block size (auto if omitted)
+- `--delta-max-literals`: fallback to full transfer when unmatched literals exceed threshold
+- `--delta-helper`: remote helper command (default `prsync --internal-remote-helper`)
+- `--no-delta-fallback`: fail if delta path fails (instead of full-transfer fallback)
+
+Remote helper deployment:
+
+1. Build locally: `cargo build --release --bin prsync`
+2. Copy the same `prsync` binary to remote PATH.
+3. Delta mode invokes remote helper via `prsync --internal-remote-helper --stdio`.
+
 ## Config and precedence
 
 - Optional config file: `~/.config/prsync/config.toml`
-- Supported keys: `jobs`, `chunk_size`, `chunk_threshold`, `retries`, `resume`, `state_dir`
-- Environment overrides: `PRSYNC_JOBS`, `PRSYNC_CHUNK_SIZE`, `PRSYNC_CHUNK_THRESHOLD`, `PRSYNC_RETRIES`, `PRSYNC_RESUME`, `PRSYNC_STATE_DIR`
-- Precedence: CLI > env > config file > built-in defaults
+- Supported keys: `jobs`, `chunk_size`, `chunk_threshold`, `retries`, `resume`, `state_dir`, `delta_enabled`, `delta_min_size`, `delta_block_size`, `delta_max_literals`, `delta_helper`, `delta_fallback`
+- Environment overrides: `PRSYNC_JOBS`, `PRSYNC_CHUNK_SIZE`, `PRSYNC_CHUNK_THRESHOLD`, `PRSYNC_RETRIES`, `PRSYNC_RESUME`, `PRSYNC_STATE_DIR`, `PRSYNC_DELTA`, `PRSYNC_DELTA_MIN_SIZE`, `PRSYNC_DELTA_BLOCK_SIZE`, `PRSYNC_DELTA_MAX_LITERALS`, `PRSYNC_DELTA_HELPER`, `PRSYNC_DELTA_FALLBACK`
+The order of precedence is CLI > env > config file > built-in defaults.
 
 You can override state location explicitly:
 
@@ -60,17 +90,4 @@ Optional metadata preservation beyond `-vrPlu`:
 - `-g`: group
 - `-A`: ACLs (`getfacl` on remote, `setfacl` on local)
 - `-X`: xattrs (`getfattr` on remote, local xattr apply)
-
-## Notes
-
-- Transfer backend is `ssh2` (libssh2) over SFTP with a connection pool.
-- `~/.ssh/config` host aliases are supported (`Host`, `HostName`, `User`, `Port`, `IdentityFile`).
-- SSH auth attempts agent, default key files (`~/.ssh/id_ed25519`, `~/.ssh/id_rsa`), then `PRSYNC_SSH_PASSWORD`.
-- Path safety checks reject absolute and `..` traversal remote entries.
-- Remote file mutation is re-checked before finalize; changed files are retried from scratch.
-
-## Test suites
-
-- Fast suite: `cargo test`
-- Docker e2e: `cargo test --test e2e_sshd -- --ignored`
-- Performance smoke: `cargo test --test perf_smoke -- --ignored`
+-

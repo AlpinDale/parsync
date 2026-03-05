@@ -63,7 +63,7 @@ pub struct Cli {
     #[arg(long = "retries")]
     pub retries: Option<usize>,
 
-    /// Override state directory path (default: <destination>/.prsync)
+    /// Override state directory path (default: `<destination>/.prsync`)
     #[arg(long = "state-dir")]
     pub state_dir: Option<std::path::PathBuf>,
 
@@ -79,7 +79,31 @@ pub struct Cli {
     #[arg(long = "dry-run", action = ArgAction::SetTrue)]
     pub dry_run: bool,
 
-    /// SSH remote source spec: [user@]host:/path
+    /// Enable rsync-style block-delta transfer for eligible files
+    #[arg(long = "delta", action = ArgAction::SetTrue)]
+    pub delta: bool,
+
+    /// Minimum file size in bytes eligible for delta mode
+    #[arg(long = "delta-min-size")]
+    pub delta_min_size: Option<u64>,
+
+    /// Fixed delta block size in bytes (auto if omitted)
+    #[arg(long = "delta-block-size")]
+    pub delta_block_size: Option<u32>,
+
+    /// Max unmatched literal bytes before falling back to full transfer
+    #[arg(long = "delta-max-literals")]
+    pub delta_max_literals: Option<u64>,
+
+    /// Remote helper command (default: prsync --internal-remote-helper)
+    #[arg(long = "delta-helper")]
+    pub delta_helper: Option<String>,
+
+    /// Fail instead of falling back to full transfer when delta path fails
+    #[arg(long = "no-delta-fallback", action = ArgAction::SetTrue)]
+    pub no_delta_fallback: bool,
+
+    /// SSH remote source spec: `[user@]host:/path`
     pub remote_source: String,
 
     /// Local destination path

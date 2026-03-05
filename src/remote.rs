@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     ffi::OsString,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
@@ -10,6 +10,8 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use ssh2::{FileStat, Session, Sftp};
+
+use crate::delta::protocol::{BlockSigWire, DeltaPlan, HelperRequest, HelperResponse};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSpec {
@@ -128,6 +130,17 @@ pub trait RemoteClient {
     }
     fn read_range(&self, relative_path: &Path, offset: u64, len: u64) -> Result<Vec<u8>>;
     fn stat_file(&self, relative_path: &Path) -> Result<RemoteFileStat>;
+    fn generate_delta_plan(
+        &self,
+        _relative_path: &Path,
+        _source_size: u64,
+        _source_mtime_secs: i64,
+        _block_size: u32,
+        _blocks: &[BlockSigWire],
+        _helper_command: &str,
+    ) -> Result<DeltaPlan> {
+        bail!("delta helper protocol unsupported by remote implementation")
+    }
 
     fn get_acl_text(&self, _relative_path: &Path) -> Result<Option<String>> {
         Ok(None)
@@ -317,6 +330,75 @@ impl SshRemote {
         let mut conn = self.pool.checkout()?;
         conn.exec(command)
     }
+
+    fn run_exec_with_input_output(&self, command: &str, input: &[u8]) -> Result<ExecOutput> {
+        let mut conn = self.pool.checkout()?;
+        conn.exec_with_input(command, input)
+    }
+
+    fn run_shell_delta_fallback(&self, req: &HelperRequest) -> Result<ExecOutput> {
+        let req_json = serde_json::to_vec(req).context("serialize fallback request")?;
+        let req_b64 = STANDARD.encode(req_json);
+        let py = r#"python3 - <<'PY'
+import base64, json, os, pathlib, sys, hashlib
+def weak_hash(buf):
+    MOD=1<<16
+    a=0
+    b=0
+    n=len(buf)
+    for i,x in enumerate(buf):
+        a=(a+x)%MOD
+        b=(b+((n-i)*x))%MOD
+    return ((b<<16)|a) & 0xffffffff
+def strong_hash(buf):
+    return hashlib.md5(buf).hexdigest()
+req=json.loads(base64.b64decode(os.environ['PRSYNC_DELTA_REQ_B64']))
+p=pathlib.Path(req['source_path'])
+data=p.read_bytes()
+bs=int(req['block_size'])
+byweak={}
+for b in req['blocks']:
+    byweak.setdefault(int(b['weak']), []).append(b)
+ops=[]
+i=0
+lit_start=0
+copy_bytes=0
+while bs>0 and i+bs<=len(data):
+    w=weak_hash(data[i:i+bs])
+    m=None
+    for cand in byweak.get(w,[]):
+        if int(cand['len'])==bs and cand['strong_hex'].lower()==strong_hash(data[i:i+bs]):
+            m=cand
+            break
+    if m is not None:
+        if lit_start<i:
+            ops.append({'kind':'Literal','data_b64':base64.b64encode(data[lit_start:i]).decode()})
+        ops.append({'kind':'Copy','block_index':int(m['index']),'len':int(m['len'])})
+        copy_bytes += int(m['len'])
+        i += bs
+        lit_start = i
+        continue
+    i += 1
+if lit_start < len(data):
+    ops.append({'kind':'Literal','data_b64':base64.b64encode(data[lit_start:]).decode()})
+out={
+  'protocol_version':1,
+  'source_size':len(data),
+  'source_mtime_secs':int(req.get('mtime_secs',0)),
+  'ops':ops,
+  'final_digest_hex':strong_hash(data),
+  'literal_bytes':len(data)-copy_bytes,
+  'copy_bytes':copy_bytes
+}
+sys.stdout.write(json.dumps(out))
+PY"#;
+        let cmd = format!(
+            "PRSYNC_DELTA_REQ_B64={} sh -lc {}",
+            shell_quote_word(&req_b64),
+            shell_quote_word(py)
+        );
+        self.run_exec_output(&cmd)
+    }
 }
 
 impl RemoteClient for SshRemote {
@@ -440,6 +522,55 @@ impl RemoteClient for SshRemote {
             output.stderr.trim()
         )
     }
+
+    fn generate_delta_plan(
+        &self,
+        relative_path: &Path,
+        source_size: u64,
+        source_mtime_secs: i64,
+        block_size: u32,
+        blocks: &[BlockSigWire],
+        helper_command: &str,
+    ) -> Result<DeltaPlan> {
+        let full_path = self.remote_path_for(relative_path);
+        let req = HelperRequest {
+            protocol_version: 1,
+            source_path: full_path.to_string_lossy().to_string(),
+            file_size: source_size,
+            mtime_secs: source_mtime_secs,
+            block_size,
+            blocks: blocks.to_vec(),
+            max_literals: u64::MAX,
+        };
+        let payload = serde_json::to_vec(&req).context("serialize delta helper request")?;
+        let helper_cmd = format!("{helper_command} --stdio");
+        let output = self
+            .run_exec_with_input_output(&helper_cmd, &payload)
+            .or_else(|primary_err| {
+                self.run_shell_delta_fallback(&req).map_err(|fallback_err| {
+                    primary_err.context(format!(
+                        "delta helper unavailable and shell fallback failed: {fallback_err:#}"
+                    ))
+                })
+            })?;
+        if output.exit_status != 0 {
+            bail!(
+                "delta helper failed ({}): {}",
+                output.exit_status,
+                output.stderr.trim()
+            );
+        }
+        let resp: HelperResponse =
+            serde_json::from_slice(&output.stdout).context("parse delta helper response")?;
+        Ok(DeltaPlan {
+            ops: resp.ops,
+            final_digest_hex: resp.final_digest_hex,
+            literal_bytes: resp.literal_bytes,
+            copy_bytes: resp.copy_bytes,
+            source_size: resp.source_size,
+            source_mtime_secs: resp.source_mtime_secs,
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -557,6 +688,31 @@ impl Connection {
             .exec(cmd)
             .with_context(|| format!("exec remote command: {cmd}"))?;
 
+        let mut stdout = Vec::new();
+        channel
+            .read_to_end(&mut stdout)
+            .context("read command stdout")?;
+        let mut stderr = String::new();
+        channel
+            .stderr()
+            .read_to_string(&mut stderr)
+            .context("read command stderr")?;
+        channel.wait_close().context("wait for command close")?;
+        let exit_status = channel.exit_status().context("read command exit status")?;
+        Ok(ExecOutput {
+            stdout,
+            stderr,
+            exit_status,
+        })
+    }
+
+    fn exec_with_input(&mut self, cmd: &str, input: &[u8]) -> Result<ExecOutput> {
+        let mut channel = self.session.channel_session().context("open ssh channel")?;
+        channel
+            .exec(cmd)
+            .with_context(|| format!("exec remote command: {cmd}"))?;
+        channel.write_all(input).context("write command stdin")?;
+        channel.send_eof().context("send eof to remote command")?;
         let mut stdout = Vec::new();
         channel
             .read_to_end(&mut stdout)
@@ -815,6 +971,13 @@ impl<'a> PooledConnection<'a> {
             .exec(cmd)
     }
 
+    fn exec_with_input(&mut self, cmd: &str, input: &[u8]) -> Result<ExecOutput> {
+        self.conn
+            .as_mut()
+            .ok_or_else(|| anyhow!("missing pooled connection"))?
+            .exec_with_input(cmd, input)
+    }
+
     fn stream_find_entries(
         &mut self,
         root: &Path,
@@ -862,6 +1025,11 @@ fn entry_kind_from_perm(perm: u32) -> EntryKind {
 fn shell_quote(path: &Path) -> String {
     let s = path.to_string_lossy();
     let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
+
+fn shell_quote_word(value: &str) -> String {
+    let escaped = value.replace('\'', "'\\''");
     format!("'{escaped}'")
 }
 

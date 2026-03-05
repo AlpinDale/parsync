@@ -21,6 +21,17 @@ pub struct FileState {
     pub part_name: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DeltaSessionState {
+    pub basis_digest_hex: String,
+    pub source_size: u64,
+    pub source_mtime_secs: i64,
+    pub block_size: u32,
+    pub protocol_version: u32,
+    pub finished: bool,
+    pub last_op_index: u64,
+}
+
 #[derive(Debug)]
 pub struct StateStore {
     conn: Connection,
@@ -152,6 +163,7 @@ impl StateStore {
     pub fn clear_all(&self) -> Result<()> {
         self.conn.execute("DELETE FROM file_chunks", [])?;
         self.conn.execute("DELETE FROM files", [])?;
+        self.conn.execute("DELETE FROM delta_sessions", [])?;
         Ok(())
     }
 
@@ -294,6 +306,10 @@ impl StateStore {
             if !valid_keys.contains(&key) {
                 self.conn
                     .execute("DELETE FROM files WHERE path_key = ?1", params![key])?;
+                self.conn.execute(
+                    "DELETE FROM delta_sessions WHERE path_key = ?1",
+                    params![key],
+                )?;
             }
         }
 
@@ -307,6 +323,87 @@ impl StateStore {
             }
         }
 
+        Ok(())
+    }
+
+    pub fn upsert_delta_session(
+        &self,
+        rel: &Path,
+        basis_digest_hex: &str,
+        source_size: u64,
+        source_mtime_secs: i64,
+        block_size: u32,
+    ) -> Result<()> {
+        let key = Self::key_for(rel);
+        self.conn.execute(
+            "INSERT INTO delta_sessions(path_key, basis_digest_hex, source_size, source_mtime_secs, block_size, protocol_version, finished, last_op_index)
+             VALUES(?1, ?2, ?3, ?4, ?5, 1, 0, 0)
+             ON CONFLICT(path_key) DO UPDATE
+               SET basis_digest_hex=excluded.basis_digest_hex,
+                   source_size=excluded.source_size,
+                   source_mtime_secs=excluded.source_mtime_secs,
+                   block_size=excluded.block_size,
+                   protocol_version=1,
+                   finished=0,
+                   last_op_index=0",
+            params![
+                key,
+                basis_digest_hex,
+                source_size as i64,
+                source_mtime_secs,
+                block_size as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delta_session(&self, rel: &Path) -> Result<Option<DeltaSessionState>> {
+        let key = Self::key_for(rel);
+        self.conn
+            .query_row(
+                "SELECT basis_digest_hex, source_size, source_mtime_secs, block_size, protocol_version, finished, last_op_index
+                 FROM delta_sessions WHERE path_key = ?1",
+                params![key],
+                |r| {
+                    Ok(DeltaSessionState {
+                        basis_digest_hex: r.get::<_, String>(0)?,
+                        source_size: r.get::<_, i64>(1)? as u64,
+                        source_mtime_secs: r.get::<_, i64>(2)?,
+                        block_size: r.get::<_, i64>(3)? as u32,
+                        protocol_version: r.get::<_, i64>(4)? as u32,
+                        finished: r.get::<_, i64>(5)? != 0,
+                        last_op_index: r.get::<_, i64>(6)? as u64,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn mark_delta_op_progress(&self, rel: &Path, last_op_index: u64) -> Result<()> {
+        let key = Self::key_for(rel);
+        self.conn.execute(
+            "UPDATE delta_sessions SET last_op_index = ?2 WHERE path_key = ?1",
+            params![key, last_op_index as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_delta_finished(&self, rel: &Path) -> Result<()> {
+        let key = Self::key_for(rel);
+        self.conn.execute(
+            "UPDATE delta_sessions SET finished = 1 WHERE path_key = ?1",
+            params![key],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_delta_session(&self, rel: &Path) -> Result<()> {
+        let key = Self::key_for(rel);
+        self.conn.execute(
+            "DELETE FROM delta_sessions WHERE path_key = ?1",
+            params![key],
+        )?;
         Ok(())
     }
 }
@@ -333,6 +430,17 @@ fn migrate(conn: &Connection) -> Result<()> {
             chunk_idx INTEGER NOT NULL,
             PRIMARY KEY(path_key, chunk_idx),
             FOREIGN KEY(path_key) REFERENCES files(path_key) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS delta_sessions (
+            path_key TEXT PRIMARY KEY,
+            basis_digest_hex TEXT NOT NULL,
+            source_size INTEGER NOT NULL,
+            source_mtime_secs INTEGER NOT NULL,
+            block_size INTEGER NOT NULL,
+            protocol_version INTEGER NOT NULL,
+            finished INTEGER NOT NULL,
+            last_op_index INTEGER NOT NULL
         );
         ",
     )?;

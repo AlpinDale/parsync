@@ -112,6 +112,12 @@ fn opts(jobs: usize) -> SyncOptions {
         resume: true,
         dry_run: false,
         state_root: None,
+        delta_enabled: false,
+        delta_min_size: 8 * 1024 * 1024,
+        delta_block_size: None,
+        delta_max_literals: 64 * 1024 * 1024,
+        delta_helper: "prsync --internal-remote-helper".to_string(),
+        delta_fallback: true,
     }
 }
 
