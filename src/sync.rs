@@ -619,30 +619,32 @@ fn transfer_one<R: RemoteClient + Sync>(
         if options.strict_durability {
             part_file.as_ref().sync_all()?;
         }
-        let latest = remote.stat_file(&job.entry.relative_path)?;
-        if latest.size != job.entry.size || latest.mtime_secs != job.entry.mtime_secs {
-            let already_counted = attempt_transferred.load(Ordering::Relaxed);
-            if already_counted > 0 {
-                ui.dec_chunk_bytes(already_counted);
+        if options.strict_durability {
+            let latest = remote.stat_file(&job.entry.relative_path)?;
+            if latest.size != job.entry.size || latest.mtime_secs != job.entry.mtime_secs {
+                let already_counted = attempt_transferred.load(Ordering::Relaxed);
+                if already_counted > 0 {
+                    ui.dec_chunk_bytes(already_counted);
+                }
+                let _ = fs::remove_file(&part_path);
+                let state_started = Instant::now();
+                {
+                    let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                    locked.reset_progress(&job.entry.relative_path)?;
+                    locked.save()?;
+                }
+                perf.state_commit_ms.fetch_add(
+                    state_started.elapsed().as_millis() as u64,
+                    Ordering::Relaxed,
+                );
+                if change_retry == 0 {
+                    continue;
+                }
+                bail!(
+                    "remote file changed during transfer: {}",
+                    job.entry.relative_path.display()
+                );
             }
-            let _ = fs::remove_file(&part_path);
-            let state_started = Instant::now();
-            {
-                let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
-                locked.reset_progress(&job.entry.relative_path)?;
-                locked.save()?;
-            }
-            perf.state_commit_ms.fetch_add(
-                state_started.elapsed().as_millis() as u64,
-                Ordering::Relaxed,
-            );
-            if change_retry == 0 {
-                continue;
-            }
-            bail!(
-                "remote file changed during transfer: {}",
-                job.entry.relative_path.display()
-            );
         }
 
         let finalize_started = Instant::now();

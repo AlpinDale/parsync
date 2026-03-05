@@ -39,6 +39,7 @@ Balanced mode defaults:
 - No per-file `sync_all` barriers (atomic rename still preserved)
 - Existing-file digest checks are skipped unless requested
 - Chunk completion state is committed in batches
+- Post-transfer remote mutation `stat` check is skipped (enabled in strict mode)
 
 Throughput flags:
 
