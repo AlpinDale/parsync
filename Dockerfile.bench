@@ -1,0 +1,19 @@
+FROM rust:alpine AS builder
+
+RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static perl make
+
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
+COPY benches/ benches/
+COPY tests/ tests/
+
+RUN cargo build --release --bench mock_sync \
+ && find /src/target/release/deps -name 'mock_sync-*' -executable -type f \
+    | head -1 | xargs -I{} cp {} /usr/local/bin/mock_sync
+
+FROM alpine:latest
+
+COPY --from=builder /usr/local/bin/mock_sync /usr/local/bin/mock_sync
+
+ENTRYPOINT ["/usr/local/bin/mock_sync"]
