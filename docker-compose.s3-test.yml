@@ -1,0 +1,73 @@
+# Docker Compose for parsync S3 integration testing with MinIO.
+#
+# Usage:
+#   docker compose -f docker-compose.s3-test.yml up -d
+#   cargo test --features s3 -- --ignored
+#   docker compose -f docker-compose.s3-test.yml down -v
+#
+# Or use the helper script:
+#   ./scripts/s3_test.sh
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: parsync-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: testuser
+      MINIO_ROOT_PASSWORD: testpass123
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - minio-data:/data
+
+  # One-shot container that creates the test bucket and seeds fixture data.
+  # Waits for minio to be healthy, then exits.
+  seed:
+    image: minio/mc:latest
+    container_name: parsync-minio-seed
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        mc alias set local http://minio:9000 testuser testpass123
+
+        # ── Bucket: test-bucket ──────────────────────────────
+        mc mb --ignore-existing local/test-bucket
+
+        # Flat files
+        echo -n "hello world"       | mc pipe local/test-bucket/hello.txt
+        printf "binary data\x00\x01\x02" | mc pipe local/test-bucket/data.bin
+
+        # Nested prefix tree (for recursive tests)
+        echo -n "root"   | mc pipe local/test-bucket/data/root.txt
+        echo -n "nested" | mc pipe local/test-bucket/data/sub/nested.txt
+        echo -n "leaf"   | mc pipe local/test-bucket/data/sub/deep/leaf.txt
+
+        # Prefixed files (for trailing-star tests)
+        echo -n "aaa" | mc pipe local/test-bucket/prefix/a.txt
+        echo -n "bbb" | mc pipe local/test-bucket/prefix/b.txt
+
+        # Many small files (for concurrency tests)
+        for i in $$(seq -w 0 49); do
+          echo -n "content of file $$i" | mc pipe local/test-bucket/batch/file_$$i.txt
+        done
+
+        # Large file: 8 MiB (for chunked / range-read tests)
+        dd if=/dev/urandom bs=1M count=8 2>/dev/null | mc pipe local/test-bucket/large/bigfile.bin
+
+        echo "=== Seed complete ==="
+        mc ls --recursive local/test-bucket/
+
+volumes:
+  minio-data:

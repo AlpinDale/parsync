@@ -9,7 +9,7 @@ homepage = "https://github.com/AlpinDale/parsync"
 documentation = "https://docs.rs/parsync"
 
 [features]
-default = []
+default = ["s3"]
 s3 = ["dep:aws-sdk-s3", "dep:aws-config", "dep:aws-types", "dep:tokio", "dep:blake3"]
 
 [dependencies]
@@ -30,7 +30,7 @@ thiserror = "2.0"
 toml = "0.8"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
-# S3 backend (optional, behind "s3" feature)
+# S3 backend (default on, disable with --no-default-features)
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", features = ["behavior-version-latest"], optional = true }
 aws-types = { version = "1", optional = true }
