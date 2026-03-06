@@ -87,3 +87,59 @@ the route selected for SSH. The same settings are available through
 `PARSYNC_RDMA`, `PARSYNC_RDMA_BIND`, `PARSYNC_RDMA_MIN_SIZE`, and
 `PARSYNC_RDMA_HELPER`, or the config file keys `rdma_mode`, `rdma_bind`,
 `rdma_min_size`, and `rdma_helper`.
+
+### Excluding files
+
+Use `--exclude` to skip paths (rsync-style patterns). Patterns are applied on the remote when listing via `find`, or client-side when using the walk fallback.
+
+```bash
+parsync -vrPlu --exclude '*.o' --exclude 'build/' --exclude '.git/' user@host:/src /dst
+```
+
+- **Basename patterns** (no slash): match any file or directory with that name at any depth, e.g. `*.o`, `node_modules`.
+- **Path patterns** (with slash): match that relative path and, for directories, their contents, e.g. `path/to/dir`.
+- **Trailing slash**: exclude that directory and everything under it, e.g. `build/`, `.git/`.
+
+Multiple `--exclude` options can be given. Empty patterns are ignored.
+
+## Performance tuning
+
+```bash
+parsync -vrPlu --jobs 16 --chunk-size 16777216 --chunk-threshold 134217728 user@host:/src /dst
+```
+
+Balanced mode defaults:
+
+- no per-file `sync_all` barriers (atomic rename preserved)
+- existing-file digest checks are skipped unless requested
+- chunk completion state is committed in batches
+- post-transfer remote mutation `stat` check is skipped (enabled in strict mode)
+
+Throughput flags:
+
+- `--strict-durability`: enable fsync-heavy strict mode
+- `--verify-existing`: hash existing files before skip decisions
+- `--sftp-read-concurrency`: parallel per-file read requests for large files
+- `--sftp-read-chunk-size`: read request size for SFTP range pulls
+
+### Notes on Windows metadata behavior
+
+- `-A`, `-X`: warn and continue (unsupported)
+- `-o`, `-g`: warn and continue (unsupported)
+- `-p`: best-effort (readonly mapping), then continue
+- `-l`: attempts symlink creation; if OS/privilege disallows it, symlink is skipped with warning
+
+Enable strict mode to hard-fail on unsupported behavior:
+
+```bash
+parsync --strict-windows-metadata -vrPlu user@host:/src C:\\dst
+```
+
+## Windows symlink troubleshooting
+
+Windows symlink creation usually requires one of:
+
+- Administrator privileges
+- Developer Mode enabled
+
+If not available, `-l` may skip symlinks (or fail with `--strict-windows-metadata`).

@@ -98,6 +98,7 @@ pub struct SyncOptions {
     #[cfg(target_os = "linux")]
     pub rdma_helper: String,
     pub strict_windows_metadata: bool,
+    pub exclude_patterns: Vec<String>,
 }
 
 impl SyncOptions {
@@ -141,6 +142,7 @@ impl SyncOptions {
             #[cfg(target_os = "linux")]
             rdma_helper: resolved.rdma_helper,
             strict_windows_metadata: resolved.strict_windows_metadata,
+            exclude_patterns: cli.exclude.clone(),
         })
     }
 }
@@ -230,7 +232,7 @@ pub fn run_sync(cli: Cli) -> Result<RunSummary> {
                 &options,
                 "stage=connecting: establishing ssh connection pool...",
             );
-            let remote = SshRemote::connect(spec, options.jobs)?;
+            let remote = SshRemote::connect(spec, options.jobs, options.exclude_patterns.clone())?;
             log_status(
                 &options,
                 "stage=connecting: ssh connection pool established",
@@ -2320,6 +2322,7 @@ mod tests {
             strict_windows_metadata: false,
             remote_source: source,
             local_destination: destination,
+            exclude: vec![],
         }
     }
 
@@ -2362,6 +2365,7 @@ mod tests {
             #[cfg(target_os = "linux")]
             rdma_helper: "parsync --internal-rdma-send".to_string(),
             strict_windows_metadata: false,
+            exclude_patterns: vec![],
         }
     }
 
