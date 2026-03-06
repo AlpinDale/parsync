@@ -88,6 +88,10 @@ pub struct Cli {
     #[arg(long = "dry-run", action = ArgAction::SetTrue)]
     pub dry_run: bool,
 
+    /// Delete on destination what is not on source (after sync)
+    #[arg(long = "delete", action = ArgAction::SetTrue)]
+    pub delete: bool,
+
     /// Enable rsync-style block-delta transfer for eligible files
     #[arg(long = "delta", action = ArgAction::SetTrue)]
     pub delta: bool,

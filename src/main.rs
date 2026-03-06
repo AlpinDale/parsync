@@ -30,7 +30,7 @@ fn main() -> ExitCode {
         Ok(summary) => {
             if debug {
                 eprintln!(
-                    "completed: transferred={}, skipped={}, skipped_symlinks={}, bytes={}, delta_files={}, delta_fallbacks={}, rdma_files={}, rdma_fallbacks={}, rdma_bytes={}, bytes_saved={}, listing_ms={}, planning_ms={}, read_ms={}, write_ms={}, finalize_ms={}, metadata_ms={}, state_commit_ms={}",
+                    "completed: transferred={}, skipped={}, skipped_symlinks={}, bytes={}, delta_files={}, delta_fallbacks={}, rdma_files={}, rdma_fallbacks={}, rdma_bytes={}, bytes_saved={}, deleted_files={}, deleted_dirs={}, listing_ms={}, planning_ms={}, read_ms={}, write_ms={}, finalize_ms={}, metadata_ms={}, state_commit_ms={}",
                     summary.transferred_files,
                     summary.skipped_files,
                     summary.skipped_symlinks,
@@ -41,6 +41,8 @@ fn main() -> ExitCode {
                     summary.rdma_fallback_files,
                     summary.rdma_bytes,
                     summary.bytes_saved,
+                    summary.deleted_files,
+                    summary.deleted_dirs,
                     summary.listing_ms,
                     summary.planning_ms,
                     summary.transfer_read_ms,
