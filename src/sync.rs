@@ -230,7 +230,7 @@ pub fn run_sync(cli: Cli) -> Result<RunSummary> {
                 &options,
                 "stage=connecting: establishing ssh connection pool...",
             );
-            let remote = SshRemote::connect(spec, options.jobs)?;
+            let remote = SshRemote::connect(spec, options.jobs, cli.identity_file.clone())?;
             log_status(
                 &options,
                 "stage=connecting: ssh connection pool established",
@@ -2320,6 +2320,7 @@ mod tests {
             strict_windows_metadata: false,
             remote_source: source,
             local_destination: destination,
+            identity_file: None,
         }
     }
 

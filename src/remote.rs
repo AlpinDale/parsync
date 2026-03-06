@@ -284,9 +284,13 @@ pub struct SshRemote {
 }
 
 impl SshRemote {
-    pub fn connect(spec: RemoteSpec, pool_size: usize) -> Result<Self> {
+    pub fn connect(
+        spec: RemoteSpec,
+        pool_size: usize,
+        identity_file_override: Option<PathBuf>,
+    ) -> Result<Self> {
         let star_children_mode = spec.path_trailing_star;
-        let target = resolve_connect_target(&spec)?;
+        let target = resolve_connect_target(&spec, identity_file_override.as_ref())?;
         let pool = Arc::new(ConnectionPool::new(target, pool_size.max(1))?);
         let root_path = PathBuf::from(spec.path.clone());
 
@@ -1073,7 +1077,10 @@ struct ConnectTarget {
     identity_files: Vec<PathBuf>,
 }
 
-fn resolve_connect_target(spec: &RemoteSpec) -> Result<ConnectTarget> {
+fn resolve_connect_target(
+    spec: &RemoteSpec,
+    identity_file_override: Option<&PathBuf>,
+) -> Result<ConnectTarget> {
     let config = load_user_ssh_config().unwrap_or_default();
     let cfg = config.resolve_for_host(&spec.host);
 
@@ -1091,11 +1098,19 @@ fn resolve_connect_target(spec: &RemoteSpec) -> Result<ConnectTarget> {
         .or_else(|| std::env::var("USER").ok())
         .ok_or_else(|| anyhow!("missing ssh username; use user@host:/path"))?;
 
-    let identity_files = cfg
+    let from_config: Vec<PathBuf> = cfg
         .identity_files
         .iter()
         .map(|p| expand_identity_file(p, &host, &user, port))
         .collect();
+
+    let identity_files = if let Some(p) = identity_file_override {
+        let mut out = vec![expand_identity_file(p, &host, &user, port)];
+        out.extend(from_config);
+        out
+    } else {
+        from_config
+    };
 
     Ok(ConnectTarget {
         host,

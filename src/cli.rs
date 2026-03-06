@@ -163,6 +163,10 @@ pub struct Cli {
     #[arg(long = "strict-windows-metadata", action = ArgAction::SetTrue)]
     pub strict_windows_metadata: bool,
 
+    /// SSH private key file
+    #[arg(short = 'i', long = "identity-file")]
+    pub identity_file: Option<std::path::PathBuf>,
+
     /// Source path or SSH remote source spec: local path or `[user@]host[:port]:path`
     pub remote_source: String,
 
