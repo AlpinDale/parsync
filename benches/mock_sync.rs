@@ -1,7 +1,6 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
@@ -177,7 +176,7 @@ fn run_once(scenario: &Scenario, jobs: usize) -> Duration {
     start.elapsed()
 }
 
-fn median(values: &mut Vec<f64>) -> f64 {
+fn median(values: &mut [f64]) -> f64 {
     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let len = values.len();
     if len == 0 {
