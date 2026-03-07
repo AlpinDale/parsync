@@ -21,3 +21,6 @@ target
 #.idea/
 
 .DS_Store
+
+# Benchmark results (regenerated via docker_bench.sh)
+bench-results/

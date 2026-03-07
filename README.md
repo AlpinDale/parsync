@@ -73,6 +73,60 @@ Throughput flags:
 - `--sftp-read-concurrency`: parallel per-file read requests for large files
 - `--sftp-read-chunk-size`: read request size for SFTP range pulls
 
+## Benchmarks
+
+Measured using an in-process mock remote with simulated per-read latency
+(no real SSH overhead). Each configuration runs 5 times; the table shows the
+median wall-clock time and speedup relative to a single worker.
+
+**Environment:** Docker `alpine:latest`, compiled with `rust:alpine` (musl).
+
+### Scaling by workload
+
+| Scenario | Jobs | Median (ms) | Mean (ms) | vs 1 job |
+|---|---:|---:|---:|---:|
+| **Many small (1000 x 4 KB, 2 ms latency)** | | | | |
+| | 1 | 3203.2 | 3186.6 | 1.00x |
+| | 2 | 1762.5 | 1764.2 | 1.82x |
+| | 4 | 1120.3 | 1132.3 | 2.86x |
+| | 8 | 806.3 | 812.0 | 3.97x |
+| | 16 | 718.2 | 748.1 | 4.46x |
+| **Medium (40 x 128 KB, 5 ms latency)** | | | | |
+| | 1 | 487.9 | 488.5 | 1.00x |
+| | 2 | 286.6 | 285.8 | 1.70x |
+| | 4 | 170.7 | 180.7 | 2.86x |
+| | 8 | 98.7 | 111.0 | 4.94x |
+| | 16 | 106.6 | 102.5 | 4.58x |
+| **Few large (5 x 10 MB, 10 ms latency)** | | | | |
+| | 1 | 8301.7 | 8301.7 | 1.00x |
+| | 2 | 5024.6 | 5160.1 | 1.65x |
+| | 4 | 3346.7 | 3355.3 | 2.48x |
+| | 8 | 1712.6 | 1795.3 | 4.85x |
+| | 16 | 1722.1 | 1725.8 | 4.82x |
+| **Mixed (200 files, 1 KB-2 MB, 5 ms latency)** | | | | |
+| | 1 | 8508.5 | 8513.8 | 1.00x |
+| | 2 | 4477.8 | 4657.2 | 1.90x |
+| | 4 | 2223.7 | 2229.5 | 3.83x |
+| | 8 | 1205.7 | 1206.6 | 7.06x |
+| | 16 | 727.4 | 739.7 | **11.70x** |
+
+### Key takeaways
+
+- Mixed workloads benefit the most from parallelism (up to **11.7x** with 16 jobs)
+- Large-file scenarios plateau around 8 jobs (I/O bound on chunk writes)
+- Small-file scenarios show diminishing returns past 8 jobs (scheduling overhead)
+- Medium workloads hit peak throughput at 8 jobs
+
+### Reproduce
+
+```bash
+# Run benchmarks in Docker Alpine
+./scripts/docker_bench.sh
+
+# Or build and run the benchmark binary directly
+cargo bench --bench mock_sync
+```
+
 ### Notes on Windows metadata behavior
 
 - `-A`, `-X`: warn and continue (unsupported)
