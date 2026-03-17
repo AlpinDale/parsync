@@ -51,14 +51,6 @@ With non-default SSH port:
 parsync -vrPlu user@example.com:2222:/remote/path /local/destination
 ```
 
-Windows-style remote paths are also accepted:
-
-```bash
-parsync -vrPlu user@example.com:C:/temp /local/destination
-parsync -vrPlu user@example.com:2222:C:/temp /local/destination
-parsync -vrPlu user@example.com:2222:/C/temp /local/destination
-```
-
 SSH config host aliases are supported.
 
 ## Performance tuning
