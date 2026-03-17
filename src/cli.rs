@@ -126,7 +126,7 @@ pub struct Cli {
     #[arg(long = "strict-windows-metadata", action = ArgAction::SetTrue)]
     pub strict_windows_metadata: bool,
 
-    /// SSH remote source spec: `[user@]host:/path`
+    /// SSH remote source spec: `[user@]host[:port]:path`
     pub remote_source: String,
 
     /// Local destination path

@@ -19,6 +19,6 @@ fn invalid_remote_spec_fails() {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("parsync"));
     cmd.args(["-r", "invalid-spec", "/tmp/dst"]);
     cmd.assert().failure().stderr(predicate::str::contains(
-        "remote must be in format [user@]host:/path",
+        "remote must be in format [user@]host[:port]:path",
     ));
 }
