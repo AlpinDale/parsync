@@ -20,6 +20,8 @@ use crate::delta::{
     protocol::{BlockSigWire, DeltaPlan, HelperRequest, HelperResponse},
 };
 
+const REMOTE_SPEC_FORMAT: &str = "remote must be in format [user@]host[:port]:path";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSpec {
     pub user: Option<String>,
@@ -76,27 +78,43 @@ impl LocalSourceSpec {
 
 impl RemoteSpec {
     pub fn parse(input: &str) -> Result<Self> {
-        let (host_part, path_part) = input
-            .rsplit_once(':')
-            .ok_or_else(|| anyhow!("remote must be in format [user@]host:/path"))?;
-        if host_part.trim().is_empty() || path_part.trim().is_empty() {
-            bail!("remote must include non-empty host and path");
-        }
-
-        let (user, host_port) = if let Some((user, host)) = host_part.split_once('@') {
+        let (user, host_and_rest) = if let Some((user, host)) = input.split_once('@') {
             if user.is_empty() || host.is_empty() {
                 bail!("invalid user@host format");
             }
             (Some(user.to_string()), host.to_string())
         } else {
-            (None, host_part.to_string())
+            (None, input.to_string())
         };
 
-        let (host, port, port_explicit) = parse_host_port(&host_port)?;
+        let (host, remainder) = host_and_rest
+            .split_once(':')
+            .ok_or_else(|| anyhow!(REMOTE_SPEC_FORMAT))?;
+        if host.trim().is_empty() || remainder.trim().is_empty() {
+            bail!("remote must include non-empty host and path");
+        }
+
+        let (port, port_explicit, path_part) =
+            if let Some((port_str, path_part)) = remainder.split_once(':') {
+                if !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
+                    let port = port_str
+                        .parse::<u16>()
+                        .with_context(|| format!("invalid port: {port_str}"))?;
+                    (port, true, path_part)
+                } else {
+                    (22, false, remainder)
+                }
+            } else {
+                (22, false, remainder)
+            };
+
+        if path_part.trim().is_empty() {
+            bail!("remote must include non-empty host and path");
+        }
 
         Ok(Self {
             user,
-            host,
+            host: host.to_string(),
             port,
             port_explicit,
             path: normalize_source_path(path_part)?,
@@ -110,21 +128,6 @@ impl RemoteSpec {
             None => self.host.clone(),
         }
     }
-}
-
-fn parse_host_port(host_port: &str) -> Result<(String, u16, bool)> {
-    if let Some((host, port_str)) = host_port.rsplit_once(':') {
-        if host.is_empty() {
-            bail!("host cannot be empty");
-        }
-        if !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
-            let port = port_str
-                .parse::<u16>()
-                .with_context(|| format!("invalid port: {port_str}"))?;
-            return Ok((host.to_string(), port, true));
-        }
-    }
-    Ok((host_port.to_string(), 22, false))
 }
 
 fn normalize_local_source_path(raw: &str) -> Result<(&str, bool)> {
@@ -164,7 +167,6 @@ fn looks_like_local_source(input: &str) -> bool {
 
     !input.contains(':')
 }
-
 fn normalize_source_path(raw: &str) -> Result<String> {
     if raw.ends_with("/*") {
         let trimmed = raw.trim_end_matches('*').trim_end_matches('/');
@@ -2149,6 +2151,36 @@ mod tests {
         let spec = RemoteSpec::parse("alice@example.com:2222:/srv/data").expect("parse");
         assert_eq!(spec.user.as_deref(), Some("alice"));
         assert_eq!(spec.host, "example.com");
+        assert_eq!(spec.port, 2222);
+        assert!(spec.port_explicit);
+    }
+
+    #[test]
+    fn parse_remote_with_windows_drive_path() {
+        let spec = RemoteSpec::parse("alice@example.com:C:/srv/data").expect("parse");
+        assert_eq!(spec.user.as_deref(), Some("alice"));
+        assert_eq!(spec.host, "example.com");
+        assert_eq!(spec.path, "C:/srv/data");
+        assert_eq!(spec.port, 22);
+        assert!(!spec.port_explicit);
+    }
+
+    #[test]
+    fn parse_remote_with_port_and_windows_drive_path() {
+        let spec = RemoteSpec::parse("alice@example.com:2222:C:/srv/data").expect("parse");
+        assert_eq!(spec.user.as_deref(), Some("alice"));
+        assert_eq!(spec.host, "example.com");
+        assert_eq!(spec.path, "C:/srv/data");
+        assert_eq!(spec.port, 2222);
+        assert!(spec.port_explicit);
+    }
+
+    #[test]
+    fn parse_remote_with_port_and_windows_style_unix_path() {
+        let spec = RemoteSpec::parse("alice@example.com:2222:/C/srv/data").expect("parse");
+        assert_eq!(spec.user.as_deref(), Some("alice"));
+        assert_eq!(spec.host, "example.com");
+        assert_eq!(spec.path, "/C/srv/data");
         assert_eq!(spec.port, 2222);
         assert!(spec.port_explicit);
     }

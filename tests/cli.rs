@@ -22,3 +22,12 @@ fn missing_local_source_fails() {
         .failure()
         .stderr(predicate::str::contains("local source path not found"));
 }
+
+#[test]
+fn invalid_remote_spec_fails() {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("parsync"));
+    cmd.args(["-r", "host:", "/tmp/dst"]);
+    cmd.assert().failure().stderr(predicate::str::contains(
+        "remote must include non-empty host and path",
+    ));
+}
