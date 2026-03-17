@@ -287,17 +287,11 @@ impl SshRemote {
     }
 
     fn remote_path_for(&self, relative_path: &Path) -> PathBuf {
-        if self.root_kind != EntryKind::Dir {
-            return self.root_path.clone();
-        }
-        let source_relative = if self.star_children_mode {
-            relative_path
+        if self.root_kind == EntryKind::Dir {
+            self.root_path.join(relative_path)
         } else {
-            relative_path
-                .strip_prefix(&self.root_basename)
-                .unwrap_or(relative_path)
-        };
-        self.root_path.join(source_relative)
+            self.root_path.clone()
+        }
     }
 
     fn collect_single_root_entry(&self) -> Result<RemoteEntry> {
@@ -328,14 +322,8 @@ impl SshRemote {
         progress: Option<&dyn Fn(usize)>,
     ) -> Result<Vec<RemoteEntry>> {
         let mut out = Vec::new();
-        let initial_rel = if self.star_children_mode {
-            PathBuf::new()
-        } else {
-            out.push(self.collect_single_root_entry()?);
-            self.root_basename.clone()
-        };
-        let mut stack = vec![(self.root_path.clone(), initial_rel)];
-        let mut found = out.len();
+        let mut stack = vec![(self.root_path.clone(), PathBuf::new())];
+        let mut found = 0_usize;
 
         while let Some((remote_dir, rel_dir)) = stack.pop() {
             let mut conn = self.pool.checkout()?;
@@ -427,13 +415,6 @@ impl SshRemote {
             self.star_children_mode,
             progress,
         )?;
-
-        if !self.star_children_mode {
-            for entry in &mut out {
-                entry.relative_path = self.root_basename.join(&entry.relative_path);
-            }
-            out.push(self.collect_single_root_entry()?);
-        }
 
         out.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
         if let Some(cb) = progress {
