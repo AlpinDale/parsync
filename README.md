@@ -1,6 +1,8 @@
 # parsync
 
-`parsync` is a high-throughput, resumable sync tool for SSH remotes and local-to-local transfers, with parallel file transfers and optional block-delta sync.
+`parsync` is a high-throughput, resumable sync tool for SSH remotes and
+local-to-local transfers, with parallel file transfers and optional block-delta
+sync.
 
 ![demo](assets/demo.gif)
 
@@ -51,45 +53,3 @@ parsync -vrPlu user@example.com:2222:/remote/path /local/destination
 ```
 
 SSH config host aliases are supported.
-
-## Performance tuning
-
-```bash
-parsync -vrPlu --jobs 16 --chunk-size 16777216 --chunk-threshold 134217728 user@host:/src /dst
-```
-
-Balanced mode defaults:
-
-- no per-file `sync_all` barriers (atomic rename preserved)
-- existing-file digest checks are skipped unless requested
-- chunk completion state is committed in batches
-- post-transfer remote mutation `stat` check is skipped (enabled in strict mode)
-
-Throughput flags:
-
-- `--strict-durability`: enable fsync-heavy strict mode
-- `--verify-existing`: hash existing files before skip decisions
-- `--sftp-read-concurrency`: parallel per-file read requests for large files
-- `--sftp-read-chunk-size`: read request size for SFTP range pulls
-
-### Notes on Windows metadata behavior
-
-- `-A`, `-X`: warn and continue (unsupported)
-- `-o`, `-g`: warn and continue (unsupported)
-- `-p`: best-effort (readonly mapping), then continue
-- `-l`: attempts symlink creation; if OS/privilege disallows it, symlink is skipped with warning
-
-Enable strict mode to hard-fail on unsupported behavior:
-
-```bash
-parsync --strict-windows-metadata -vrPlu user@host:/src C:\\dst
-```
-
-## Windows symlink troubleshooting
-
-Windows symlink creation usually requires one of:
-
-- Administrator privileges
-- Developer Mode enabled
-
-If not available, `-l` may skip symlinks (or fail with `--strict-windows-metadata`).
