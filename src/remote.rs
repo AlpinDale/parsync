@@ -1,11 +1,13 @@
 #[cfg(unix)]
 use std::ffi::OsString;
 #[cfg(unix)]
+use std::io;
+#[cfg(unix)]
 use std::process::Command;
 use std::{
     collections::HashSet,
     fs,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     net::TcpStream,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
@@ -1459,7 +1461,7 @@ fn metadata_mtime_secs(metadata: &fs::Metadata) -> i64 {
         metadata
             .modified()
             .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0)
     }
@@ -1467,8 +1469,11 @@ fn metadata_mtime_secs(metadata: &fs::Metadata) -> i64 {
 
 fn metadata_mode_uid_gid(
     metadata: &fs::Metadata,
-    _kind: &EntryKind,
+    kind: &EntryKind,
 ) -> (u32, Option<u32>, Option<u32>) {
+    #[cfg(unix)]
+    let _ = kind;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1561,18 +1566,9 @@ fn fast_copy_local_file(source: &Path, destination: &Path) -> Result<bool> {
         let err = io::Error::last_os_error();
         let _ = fs::remove_file(destination);
         match err.raw_os_error() {
-            Some(code)
-                if matches!(
-                    code,
-                    nix::libc::EOPNOTSUPP
-                        | nix::libc::ENOTSUP
-                        | nix::libc::EXDEV
-                        | nix::libc::EINVAL
-                        | nix::libc::ENOTTY
-                ) =>
-            {
-                Ok(false)
-            }
+            Some(
+                nix::libc::EOPNOTSUPP | nix::libc::EXDEV | nix::libc::EINVAL | nix::libc::ENOTTY,
+            ) => Ok(false),
             _ => Err(err).with_context(|| {
                 format!("reflink {} -> {}", source.display(), destination.display())
             }),
