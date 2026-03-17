@@ -44,20 +44,19 @@ impl RemoteSpec {
             bail!("remote must include non-empty host and path");
         }
 
-        let (port, port_explicit, path_part) = if let Some((port_str, path_part)) =
-            remainder.split_once(':')
-        {
-            if !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
-                let port = port_str
-                    .parse::<u16>()
-                    .with_context(|| format!("invalid port: {port_str}"))?;
-                (port, true, path_part)
+        let (port, port_explicit, path_part) =
+            if let Some((port_str, path_part)) = remainder.split_once(':') {
+                if !port_str.is_empty() && port_str.chars().all(|c| c.is_ascii_digit()) {
+                    let port = port_str
+                        .parse::<u16>()
+                        .with_context(|| format!("invalid port: {port_str}"))?;
+                    (port, true, path_part)
+                } else {
+                    (22, false, remainder)
+                }
             } else {
                 (22, false, remainder)
-            }
-        } else {
-            (22, false, remainder)
-        };
+            };
 
         if path_part.trim().is_empty() {
             bail!("remote must include non-empty host and path");
