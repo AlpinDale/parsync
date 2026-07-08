@@ -1,4 +1,8 @@
+use std::net::IpAddr;
+
 use clap::{ArgAction, Parser};
+
+use crate::rdma::RdmaMode;
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -122,6 +126,32 @@ pub struct Cli {
     #[arg(long = "sftp-read-chunk-size")]
     pub sftp_read_chunk_size: Option<u64>,
 
+    /// RDMA fast-path mode for SSH file transfers: auto, off, or require
+    #[arg(
+        long = "rdma",
+        value_enum,
+        num_args = 0..=1,
+        default_missing_value = "auto",
+        require_equals = true
+    )]
+    pub rdma: Option<RdmaMode>,
+
+    /// Disable the RDMA transfer fast path
+    #[arg(long = "no-rdma", action = ArgAction::SetTrue, conflicts_with = "rdma")]
+    pub no_rdma: bool,
+
+    /// Local IPv4 address to advertise for incoming RDMA transfers
+    #[arg(long = "rdma-bind")]
+    pub rdma_bind: Option<IpAddr>,
+
+    /// Minimum file size in bytes eligible for the RDMA fast path
+    #[arg(long = "rdma-min-size")]
+    pub rdma_min_size: Option<u64>,
+
+    /// Remote RDMA helper command (default: parsync --internal-rdma-send)
+    #[arg(long = "rdma-helper")]
+    pub rdma_helper: Option<String>,
+
     /// On Windows, fail when requested metadata/symlink preservation is unsupported
     #[arg(long = "strict-windows-metadata", action = ArgAction::SetTrue)]
     pub strict_windows_metadata: bool,
@@ -162,6 +192,8 @@ impl Cli {
 mod tests {
     use clap::Parser;
 
+    use crate::rdma::RdmaMode;
+
     use super::Cli;
 
     #[test]
@@ -174,5 +206,22 @@ mod tests {
         assert!(cli.update);
         assert!(cli.partial());
         assert!(cli.progress());
+    }
+
+    #[test]
+    fn parses_rdma_controls() {
+        let cli = Cli::parse_from([
+            "parsync",
+            "--rdma=require",
+            "--rdma-bind",
+            "10.10.0.12",
+            "--rdma-min-size",
+            "1048576",
+            "user@h:/r",
+            "/tmp/d",
+        ]);
+        assert_eq!(cli.rdma, Some(RdmaMode::Require));
+        assert_eq!(cli.rdma_bind.unwrap().to_string(), "10.10.0.12");
+        assert_eq!(cli.rdma_min_size, Some(1_048_576));
     }
 }
