@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_RDMA_MIN_SIZE: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_RDMA_CHUNK_SIZE: usize = 64 * 1024;
 pub const DEFAULT_RDMA_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_RDMA_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
 
 const PROTOCOL_VERSION: u16 = 1;
 const MAGIC: &[u8; 8] = b"PRDMA001";
@@ -71,7 +72,23 @@ pub struct RdmaTransferOptions {
 #[derive(Debug, Clone)]
 pub enum RdmaCopyResult {
     Copied { bytes: u64, chunks: u64 },
-    Unavailable { reason: String },
+    Unavailable { reason: String, cache_for_run: bool },
+}
+
+impl RdmaCopyResult {
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+            cache_for_run: false,
+        }
+    }
+
+    pub fn setup_unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+            cache_for_run: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +357,14 @@ mod linux {
         unsafe extern "C" fn(*mut libc::pollfd, libc::nfds_t, libc::c_int) -> libc::c_int;
     type RgetsocknameFn =
         unsafe extern "C" fn(libc::c_int, *mut libc::sockaddr, *mut libc::socklen_t) -> libc::c_int;
+    type RgetsockoptFn = unsafe extern "C" fn(
+        libc::c_int,
+        libc::c_int,
+        libc::c_int,
+        *mut libc::c_void,
+        *mut libc::socklen_t,
+    ) -> libc::c_int;
+    type RfcntlFn = unsafe extern "C" fn(libc::c_int, libc::c_int, ...) -> libc::c_int;
 
     struct RsocketApi {
         rsocket: RsocketFn,
@@ -352,6 +377,8 @@ mod linux {
         rsend: RsendFn,
         rpoll: RpollFn,
         rgetsockname: RgetsocknameFn,
+        rgetsockopt: RgetsockoptFn,
+        rfcntl: RfcntlFn,
     }
 
     static RSOCKET_API: OnceLock<std::result::Result<RsocketApi, String>> = OnceLock::new();
@@ -380,6 +407,8 @@ mod linux {
             rsend: load_symbol(handle, b"rsend\0")?,
             rpoll: load_symbol(handle, b"rpoll\0")?,
             rgetsockname: load_symbol(handle, b"rgetsockname\0")?,
+            rgetsockopt: load_symbol(handle, b"rgetsockopt\0")?,
+            rfcntl: load_symbol(handle, b"rfcntl\0")?,
         })
     }
 
@@ -416,6 +445,17 @@ mod linux {
                 .to_string_lossy()
                 .into_owned()
         }
+    }
+
+    fn is_would_block(err: &io::Error) -> bool {
+        matches!(
+            err.raw_os_error(),
+            Some(code)
+                if code == libc::EAGAIN
+                    || code == libc::EWOULDBLOCK
+                    || code == libc::EINPROGRESS
+                    || code == libc::EALREADY
+        )
     }
 
     pub struct RdmaReceiver {
@@ -489,84 +529,92 @@ mod linux {
             let mut received = 0_u64;
             let mut chunks = 0_u64;
             let mut saw_done = false;
-            let stream = self
-                .socket
-                .accept(&cancel, self.timeout)
-                .context("accept RDMA rsocket connection")?;
-            let mut last_activity = Instant::now();
 
             while !saw_done {
-                if cancel.load(Ordering::Relaxed) {
-                    bail!("RDMA receive cancelled");
-                }
+                let stream = self
+                    .socket
+                    .accept(&cancel, self.timeout)
+                    .context("accept RDMA rsocket connection")?;
+                let stream_start = received;
+                let mut last_activity = Instant::now();
 
-                stream
-                    .recv_exact_with_timeout(
-                        &mut buf[..HEADER_LEN],
-                        &cancel,
-                        self.timeout,
-                        &mut last_activity,
-                    )
-                    .context("receive RDMA packet header")?;
-                let payload_len = packet_payload_len(&buf[..HEADER_LEN])?;
-                if payload_len > self.chunk_size {
-                    bail!(
-                        "RDMA packet payload exceeds configured chunk size ({} > {})",
-                        payload_len,
-                        self.chunk_size
-                    );
-                }
-                let packet_len = HEADER_LEN + payload_len;
-                if payload_len > 0 {
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        bail!("RDMA receive cancelled");
+                    }
+
                     stream
                         .recv_exact_with_timeout(
-                            &mut buf[HEADER_LEN..packet_len],
+                            &mut buf[..HEADER_LEN],
                             &cancel,
                             self.timeout,
                             &mut last_activity,
                         )
-                        .context("receive RDMA packet payload")?;
-                }
-                let packet = decode_packet(&buf[..packet_len])?;
-                if packet.token != self.token {
-                    continue;
-                }
+                        .context("receive RDMA packet header")?;
+                    let payload_len = packet_payload_len(&buf[..HEADER_LEN])?;
+                    if payload_len > self.chunk_size {
+                        bail!(
+                            "RDMA packet payload exceeds configured chunk size ({} > {})",
+                            payload_len,
+                            self.chunk_size
+                        );
+                    }
+                    let packet_len = HEADER_LEN + payload_len;
+                    if payload_len > 0 {
+                        stream
+                            .recv_exact_with_timeout(
+                                &mut buf[HEADER_LEN..packet_len],
+                                &cancel,
+                                self.timeout,
+                                &mut last_activity,
+                            )
+                            .context("receive RDMA packet payload")?;
+                    }
+                    let packet = decode_packet(&buf[..packet_len])?;
+                    if packet.token != self.token {
+                        if received == stream_start {
+                            break;
+                        }
+                        continue;
+                    }
 
-                match packet.kind {
-                    KIND_DATA => {
-                        if packet.offset != received {
-                            bail!(
-                                "out-of-order RDMA packet: expected offset {}, got {}",
-                                received,
-                                packet.offset
-                            );
+                    match packet.kind {
+                        KIND_DATA => {
+                            if packet.offset != received {
+                                bail!(
+                                    "out-of-order RDMA packet: expected offset {}, got {}",
+                                    received,
+                                    packet.offset
+                                );
+                            }
+                            let next = received
+                                .checked_add(packet.payload.len() as u64)
+                                .ok_or_else(|| anyhow!("RDMA byte count overflow"))?;
+                            if next > self.expected_size {
+                                bail!(
+                                    "RDMA sender exceeded expected file size ({} > {})",
+                                    next,
+                                    self.expected_size
+                                );
+                            }
+                            file.write_all(packet.payload)
+                                .context("write RDMA payload")?;
+                            received = next;
+                            chunks += 1;
                         }
-                        let next = received
-                            .checked_add(packet.payload.len() as u64)
-                            .ok_or_else(|| anyhow!("RDMA byte count overflow"))?;
-                        if next > self.expected_size {
-                            bail!(
-                                "RDMA sender exceeded expected file size ({} > {})",
-                                next,
-                                self.expected_size
-                            );
+                        KIND_DONE => {
+                            if packet.offset != received {
+                                bail!(
+                                    "RDMA done offset mismatch: expected {}, got {}",
+                                    received,
+                                    packet.offset
+                                );
+                            }
+                            saw_done = true;
+                            break;
                         }
-                        file.write_all(packet.payload)
-                            .context("write RDMA payload")?;
-                        received = next;
-                        chunks += 1;
+                        other => bail!("unknown RDMA packet kind {other}"),
                     }
-                    KIND_DONE => {
-                        if packet.offset != received {
-                            bail!(
-                                "RDMA done offset mismatch: expected {}, got {}",
-                                received,
-                                packet.offset
-                            );
-                        }
-                        saw_done = true;
-                    }
-                    other => bail!("unknown RDMA packet kind {other}"),
                 }
             }
 
@@ -597,7 +645,9 @@ mod linux {
             if fd < 0 {
                 return Err(io::Error::last_os_error()).context("open rdma-core rsocket");
             }
-            Ok(Self { fd, api })
+            let socket = Self { fd, api };
+            socket.set_nonblocking()?;
+            Ok(socket)
         }
 
         fn fd(&self) -> RawFd {
@@ -635,7 +685,7 @@ mod linux {
                 if started.elapsed() >= timeout {
                     bail!("RDMA accept timed out after {}s", timeout.as_secs());
                 }
-                if !self.poll_readable(Duration::from_secs(1))? {
+                if !self.poll_events(libc::POLLIN, Duration::from_secs(1))? {
                     continue;
                 }
                 let fd = unsafe {
@@ -646,9 +696,14 @@ mod linux {
                     if err.kind() == io::ErrorKind::Interrupted {
                         continue;
                     }
+                    if is_would_block(&err) {
+                        continue;
+                    }
                     return Err(err).context("accept RDMA rsocket connection");
                 }
-                return Ok(Self { fd, api: self.api });
+                let socket = Self { fd, api: self.api };
+                socket.set_nonblocking()?;
+                return Ok(socket);
             }
         }
 
@@ -668,7 +723,16 @@ mod linux {
             Ok(u16::from_be(addr.sin_port))
         }
 
-        fn connect(&self, destination: &libc::sockaddr_in) -> Result<()> {
+        fn connect_with_timeout<F>(
+            &self,
+            destination: &libc::sockaddr_in,
+            timeout: Duration,
+            keepalive: &mut F,
+        ) -> Result<()>
+        where
+            F: FnMut() -> Result<()>,
+        {
+            let started = Instant::now();
             let rc = unsafe {
                 (self.api.rconnect)(
                     self.fd(),
@@ -676,17 +740,49 @@ mod linux {
                     mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
                 )
             };
-            if rc < 0 {
-                return Err(io::Error::last_os_error()).context("connect RDMA rsocket");
+            if rc == 0 {
+                return Ok(());
             }
-            Ok(())
+
+            let err = io::Error::last_os_error();
+            if !is_would_block(&err) {
+                return Err(err).context("connect RDMA rsocket");
+            }
+
+            loop {
+                if started.elapsed() >= timeout {
+                    bail!(
+                        "RDMA rsocket connect timed out after {}s",
+                        timeout.as_secs()
+                    );
+                }
+                keepalive()?;
+                if !self.poll_events(libc::POLLOUT, Duration::from_secs(1))? {
+                    continue;
+                }
+                let socket_error = self.socket_error()?;
+                if socket_error == 0 {
+                    return Ok(());
+                }
+                if matches!(
+                    socket_error,
+                    code if code == libc::EINPROGRESS
+                        || code == libc::EALREADY
+                        || code == libc::EAGAIN
+                        || code == libc::EWOULDBLOCK
+                ) {
+                    continue;
+                }
+                return Err(io::Error::from_raw_os_error(socket_error))
+                    .context("connect RDMA rsocket");
+            }
         }
 
-        fn poll_readable(&self, timeout: Duration) -> Result<bool> {
+        fn poll_events(&self, events: libc::c_short, timeout: Duration) -> Result<bool> {
             let millis = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
             let mut pollfd = libc::pollfd {
                 fd: self.fd(),
-                events: libc::POLLIN,
+                events,
                 revents: 0,
             };
             loop {
@@ -698,8 +794,54 @@ mod linux {
                     }
                     return Err(err).context("poll RDMA rsocket");
                 }
-                return Ok(rc > 0 && (pollfd.revents & libc::POLLIN) != 0);
+                if rc == 0 {
+                    return Ok(false);
+                }
+                if (pollfd.revents & events) != 0 {
+                    return Ok(true);
+                }
+                if (pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)) != 0 {
+                    let socket_error = match self.socket_error() {
+                        Ok(0) | Err(_) => libc::ECONNRESET,
+                        Ok(code) => code,
+                    };
+                    return Err(io::Error::from_raw_os_error(socket_error))
+                        .context("poll RDMA rsocket");
+                }
+                return Ok(false);
             }
+        }
+
+        fn socket_error(&self) -> Result<libc::c_int> {
+            let mut value: libc::c_int = 0;
+            let mut len = mem::size_of_val(&value) as libc::socklen_t;
+            let rc = unsafe {
+                (self.api.rgetsockopt)(
+                    self.fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    &mut value as *mut _ as *mut libc::c_void,
+                    &mut len,
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error()).context("read RDMA socket error");
+            }
+            Ok(value)
+        }
+
+        fn set_nonblocking(&self) -> Result<()> {
+            let flags = unsafe { (self.api.rfcntl)(self.fd(), libc::F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error())
+                    .context("read RDMA rsocket descriptor flags");
+            }
+            let rc =
+                unsafe { (self.api.rfcntl)(self.fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) };
+            if rc < 0 {
+                return Err(io::Error::last_os_error()).context("set RDMA rsocket nonblocking");
+            }
+            Ok(())
         }
 
         fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
@@ -728,7 +870,7 @@ mod linux {
                 if cancel.load(Ordering::Relaxed) {
                     bail!("RDMA receive cancelled");
                 }
-                if !self.poll_readable(Duration::from_secs(1))? {
+                if !self.poll_events(libc::POLLIN, Duration::from_secs(1))? {
                     if last_activity.elapsed() >= timeout {
                         bail!(
                             "RDMA receive timed out after {}s of inactivity",
@@ -745,13 +887,23 @@ mod linux {
                         buf = rest;
                     }
                     Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) if is_would_block(&err) => continue,
                     Err(err) => return Err(err).context("receive RDMA rsocket bytes"),
                 }
             }
             Ok(())
         }
 
-        fn send_all(&self, mut buf: &[u8]) -> Result<()> {
+        fn send_all_with_timeout<F>(
+            &self,
+            mut buf: &[u8],
+            timeout: Duration,
+            keepalive: &mut F,
+        ) -> Result<()>
+        where
+            F: FnMut() -> Result<()>,
+        {
+            let mut last_progress = Instant::now();
             while !buf.is_empty() {
                 let n = unsafe {
                     (self.api.rsend)(self.fd(), buf.as_ptr() as *const libc::c_void, buf.len(), 0)
@@ -761,11 +913,20 @@ mod linux {
                     if err.kind() == io::ErrorKind::Interrupted {
                         continue;
                     }
+                    if is_would_block(&err) {
+                        if last_progress.elapsed() >= timeout {
+                            bail!("RDMA rsocket send timed out after {}s", timeout.as_secs());
+                        }
+                        keepalive()?;
+                        let _ = self.poll_events(libc::POLLOUT, Duration::from_secs(1))?;
+                        continue;
+                    }
                     return Err(err).context("send RDMA rsocket bytes");
                 }
                 if n == 0 {
                     bail!("RDMA rsocket sent zero bytes");
                 }
+                last_progress = Instant::now();
                 buf = &buf[n as usize..];
             }
             Ok(())
@@ -820,8 +981,16 @@ mod linux {
 
         let socket = Rsocket::open()?;
         let destination = sockaddr_in(destination_addr, request.destination_port);
-        socket.connect(&destination)?;
         keepalive()?;
+        let mut last_keepalive = Instant::now();
+        let mut emit_keepalive = || {
+            if last_keepalive.elapsed() >= DEFAULT_RDMA_KEEPALIVE_INTERVAL {
+                keepalive()?;
+                last_keepalive = Instant::now();
+            }
+            Ok(())
+        };
+        socket.connect_with_timeout(&destination, DEFAULT_RDMA_TIMEOUT, &mut emit_keepalive)?;
         let mut read_buf = vec![0_u8; chunk_size];
         let mut offset = 0_u64;
         let mut chunks = 0_u64;
@@ -834,8 +1003,7 @@ mod linux {
                 break;
             }
             let packet = encode_packet(KIND_DATA, &token, offset, &read_buf[..n])?;
-            socket.send_all(&packet)?;
-            keepalive()?;
+            socket.send_all_with_timeout(&packet, DEFAULT_RDMA_TIMEOUT, &mut emit_keepalive)?;
             offset += n as u64;
             chunks += 1;
         }
@@ -848,7 +1016,7 @@ mod linux {
             );
         }
         let done = encode_packet(KIND_DONE, &token, offset, &[])?;
-        socket.send_all(&done)?;
+        socket.send_all_with_timeout(&done, DEFAULT_RDMA_TIMEOUT, &mut emit_keepalive)?;
 
         Ok(RdmaSendReport {
             protocol_version: PROTOCOL_VERSION,

@@ -64,6 +64,11 @@ the normal SFTP/chunk transfer if RDMA is not available.
 
 The fast path can be tested without RDMA hardware by using the Linux RXE
 software RDMA driver (`rdma_rxe`) with rdma-core installed.
+An ignored integration test wraps the VM validation:
+
+```bash
+cargo test --test rdma_rxe_vm -- --ignored
+```
 
 RDMA is enabled in `auto` mode by default for SSH sources and only applies to
 files at least 64 MiB. Useful controls:

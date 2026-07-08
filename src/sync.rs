@@ -145,6 +145,7 @@ struct RuntimeWarnings {
     windows_owner_group: AtomicBool,
     windows_perms: AtomicBool,
     windows_symlink: AtomicBool,
+    rdma_disabled: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -906,6 +907,7 @@ fn try_rdma_transfer<R: RemoteClient + Sync>(
         || options.dry_run
         || job.entry.kind != EntryKind::File
         || job.entry.size < options.rdma_min_size
+        || warnings.rdma_disabled.load(Ordering::Relaxed)
     {
         return Ok((None, false));
     }
@@ -956,7 +958,10 @@ fn try_rdma_transfer<R: RemoteClient + Sync>(
 
     let (bytes, chunks) = match result {
         RdmaCopyResult::Copied { bytes, chunks } => (bytes, chunks),
-        RdmaCopyResult::Unavailable { reason } => {
+        RdmaCopyResult::Unavailable {
+            reason,
+            cache_for_run,
+        } => {
             let _ = fs::remove_file(&part_path);
             {
                 let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
@@ -965,6 +970,9 @@ fn try_rdma_transfer<R: RemoteClient + Sync>(
             }
             if options.rdma_mode == RdmaMode::Require {
                 bail!("RDMA fast path is required but unavailable: {reason}");
+            }
+            if cache_for_run {
+                warnings.rdma_disabled.store(true, Ordering::Relaxed);
             }
             vlog(
                 options,
@@ -2069,6 +2077,7 @@ mod tests {
         read_counter: Mutex<usize>,
         rdma_enabled: bool,
         rdma_unavailable: bool,
+        rdma_unavailable_cacheable: bool,
         rdma_counter: Mutex<usize>,
         stat_sequence: Mutex<Vec<RemoteFileStat>>,
     }
@@ -2083,6 +2092,7 @@ mod tests {
                 read_counter: Mutex::new(0),
                 rdma_enabled: false,
                 rdma_unavailable: false,
+                rdma_unavailable_cacheable: false,
                 rdma_counter: Mutex::new(0),
                 stat_sequence: Mutex::new(Vec::new()),
             }
@@ -2111,6 +2121,13 @@ mod tests {
         fn with_rdma_unavailable(mut self) -> Self {
             self.rdma_enabled = true;
             self.rdma_unavailable = true;
+            self
+        }
+
+        fn with_cacheable_rdma_unavailable(mut self) -> Self {
+            self.rdma_enabled = true;
+            self.rdma_unavailable = true;
+            self.rdma_unavailable_cacheable = true;
             self
         }
     }
@@ -2205,14 +2222,14 @@ mod tests {
             _options: &RdmaTransferOptions,
         ) -> Result<RdmaCopyResult> {
             if !self.rdma_enabled {
-                return Ok(RdmaCopyResult::Unavailable {
-                    reason: "mock RDMA disabled".to_string(),
-                });
+                return Ok(RdmaCopyResult::unavailable("mock RDMA disabled"));
             }
             *self.rdma_counter.lock().expect("lock") += 1;
             if self.rdma_unavailable {
-                return Ok(RdmaCopyResult::Unavailable {
-                    reason: "mock RDMA unavailable".to_string(),
+                return Ok(if self.rdma_unavailable_cacheable {
+                    RdmaCopyResult::setup_unavailable("mock RDMA unavailable")
+                } else {
+                    RdmaCopyResult::unavailable("mock RDMA unavailable")
                 });
             }
             let data = self
@@ -2513,6 +2530,56 @@ mod tests {
         assert_eq!(
             fs::read(dir.path().join("fallback.bin")).expect("read"),
             b"fallback"
+        );
+    }
+
+    #[test]
+    fn rdma_auto_caches_setup_unavailability_for_run() {
+        let dir = TempDir::new().expect("tmp");
+        let entries = vec![
+            RemoteEntry {
+                relative_path: PathBuf::from("a.bin"),
+                kind: EntryKind::File,
+                size: 8,
+                mtime_secs: 1_700_000_000,
+                mode: 0o644,
+                uid: None,
+                gid: None,
+                link_target: None,
+            },
+            RemoteEntry {
+                relative_path: PathBuf::from("b.bin"),
+                kind: EntryKind::File,
+                size: 8,
+                mtime_secs: 1_700_000_001,
+                mode: 0o644,
+                uid: None,
+                gid: None,
+                link_target: None,
+            },
+        ];
+        let mut files = BTreeMap::new();
+        files.insert(PathBuf::from("a.bin"), b"aaaaaaaa".to_vec());
+        files.insert(PathBuf::from("b.bin"), b"bbbbbbbb".to_vec());
+        let remote = MockRemote::new(entries, files).with_cacheable_rdma_unavailable();
+        let mut options = opts();
+        options.jobs = 1;
+        options.rdma_mode = RdmaMode::Auto;
+        options.rdma_min_size = 1;
+
+        let summary = run_sync_with_client(&remote, dir.path(), &options).expect("sync");
+
+        assert_eq!(summary.transferred_files, 2);
+        assert_eq!(summary.rdma_files, 0);
+        assert_eq!(summary.rdma_fallback_files, 1);
+        assert_eq!(*remote.rdma_counter.lock().expect("lock"), 1);
+        assert_eq!(
+            fs::read(dir.path().join("a.bin")).expect("read"),
+            b"aaaaaaaa"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("b.bin")).expect("read"),
+            b"bbbbbbbb"
         );
     }
 

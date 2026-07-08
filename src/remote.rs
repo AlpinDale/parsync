@@ -263,9 +263,9 @@ pub trait RemoteClient {
         _source_size: u64,
         _options: &RdmaTransferOptions,
     ) -> Result<RdmaCopyResult> {
-        Ok(RdmaCopyResult::Unavailable {
-            reason: "remote implementation does not support RDMA".to_string(),
-        })
+        Ok(RdmaCopyResult::unavailable(
+            "remote implementation does not support RDMA",
+        ))
     }
 }
 
@@ -945,9 +945,9 @@ impl RemoteClient for SshRemote {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (relative_path, destination, source_size, options);
-            return Ok(RdmaCopyResult::Unavailable {
-                reason: "RDMA fast path is only available on Linux".to_string(),
-            });
+            return Ok(RdmaCopyResult::setup_unavailable(
+                "RDMA fast path is only available on Linux",
+            ));
         }
 
         #[cfg(target_os = "linux")]
@@ -956,9 +956,7 @@ impl RemoteClient for SshRemote {
                 match rdma::ipv4_bind_addr(options.bind_addr, &self.spec.host, self.spec.port) {
                     Ok(addr) => addr,
                     Err(err) => {
-                        return Ok(RdmaCopyResult::Unavailable {
-                            reason: format!("{err:#}"),
-                        });
+                        return Ok(RdmaCopyResult::setup_unavailable(format!("{err:#}")));
                     }
                 };
 
@@ -970,9 +968,7 @@ impl RemoteClient for SshRemote {
             ) {
                 Ok(receiver) => receiver,
                 Err(err) => {
-                    return Ok(RdmaCopyResult::Unavailable {
-                        reason: format!("{err:#}"),
-                    });
+                    return Ok(RdmaCopyResult::setup_unavailable(format!("{err:#}")));
                 }
             };
 
@@ -1007,45 +1003,42 @@ impl RemoteClient for SshRemote {
             let output = match output_result {
                 Ok(output) => output,
                 Err(err) => {
-                    return Ok(RdmaCopyResult::Unavailable {
-                        reason: format!("{err:#}"),
-                    });
+                    return Ok(RdmaCopyResult::setup_unavailable(format!("{err:#}")));
                 }
             };
 
             if output.exit_status != 0 {
+                let reason = format!(
+                    "remote RDMA helper failed ({}): {}",
+                    output.exit_status,
+                    output.stderr.trim()
+                );
+                let cache_for_run = is_rdma_setup_failure(&output.stderr);
                 return Ok(RdmaCopyResult::Unavailable {
-                    reason: format!(
-                        "remote RDMA helper failed ({}): {}",
-                        output.exit_status,
-                        output.stderr.trim()
-                    ),
+                    reason,
+                    cache_for_run,
                 });
             }
 
             let received = match receive_result {
                 Ok(report) => report,
                 Err(err) => {
-                    return Ok(RdmaCopyResult::Unavailable {
-                        reason: format!("{err:#}"),
-                    });
+                    return Ok(RdmaCopyResult::setup_unavailable(format!("{err:#}")));
                 }
             };
             let sent: RdmaSendReport = match serde_json::from_slice(&output.stdout) {
                 Ok(report) => report,
                 Err(err) => {
-                    return Ok(RdmaCopyResult::Unavailable {
-                        reason: format!("parse RDMA helper report: {err}"),
-                    });
+                    return Ok(RdmaCopyResult::unavailable(format!(
+                        "parse RDMA helper report: {err}"
+                    )));
                 }
             };
             if sent.bytes_sent != received.bytes_received {
-                return Ok(RdmaCopyResult::Unavailable {
-                    reason: format!(
-                        "RDMA byte count mismatch: sender={} receiver={}",
-                        sent.bytes_sent, received.bytes_received
-                    ),
-                });
+                return Ok(RdmaCopyResult::unavailable(format!(
+                    "RDMA byte count mismatch: sender={} receiver={}",
+                    sent.bytes_sent, received.bytes_received
+                )));
             }
 
             Ok(RdmaCopyResult::Copied {
@@ -1054,6 +1047,23 @@ impl RemoteClient for SshRemote {
             })
         }
     }
+}
+
+fn is_rdma_setup_failure(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    [
+        "rdma-core rsocket transport was not detected",
+        "load librdmacm",
+        "open rdma-core rsocket",
+        "bind rdma-core rsocket",
+        "listen on rdma-core rsocket",
+        "connect rdma rsocket",
+        "send rdma rsocket bytes",
+        "rdma rsocket send timed out",
+        "rdma rsocket connect timed out",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
 }
 
 #[derive(Debug, Clone)]
