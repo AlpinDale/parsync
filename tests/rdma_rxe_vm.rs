@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 #[test]
 #[ignore = "requires virtme-ng, qemu, rdma-core, sshd, and kernel rdma_rxe support"]
 fn validates_rdma_fast_path_with_rxe_vm() {

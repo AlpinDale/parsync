@@ -10,10 +10,11 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     net::TcpStream,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex,
-    },
+    sync::{Arc, Condvar, Mutex},
+};
+#[cfg(target_os = "linux")]
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
     thread,
 };
 
@@ -25,6 +26,7 @@ use crate::delta::{
     build_delta_ops,
     protocol::{BlockSigWire, DeltaPlan, HelperRequest, HelperResponse},
 };
+#[cfg(target_os = "linux")]
 use crate::rdma::{self, RdmaCopyResult, RdmaReceiver, RdmaSendReport, RdmaTransferOptions};
 
 const REMOTE_SPEC_FORMAT: &str = "remote must be in format [user@]host[:port]:path";
@@ -252,10 +254,12 @@ pub trait RemoteClient {
         Ok(false)
     }
 
+    #[cfg(target_os = "linux")]
     fn supports_rdma_copy(&self) -> bool {
         false
     }
 
+    #[cfg(target_os = "linux")]
     fn try_rdma_copy(
         &self,
         _relative_path: &Path,
@@ -931,10 +935,12 @@ impl RemoteClient for SshRemote {
         })
     }
 
+    #[cfg(target_os = "linux")]
     fn supports_rdma_copy(&self) -> bool {
         true
     }
 
+    #[cfg(target_os = "linux")]
     fn try_rdma_copy(
         &self,
         relative_path: &Path,
@@ -942,14 +948,6 @@ impl RemoteClient for SshRemote {
         source_size: u64,
         options: &RdmaTransferOptions,
     ) -> Result<RdmaCopyResult> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (relative_path, destination, source_size, options);
-            return Ok(RdmaCopyResult::setup_unavailable(
-                "RDMA fast path is only available on Linux",
-            ));
-        }
-
         #[cfg(target_os = "linux")]
         {
             let bind_addr =
@@ -1049,6 +1047,7 @@ impl RemoteClient for SshRemote {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn is_rdma_setup_failure(stderr: &str) -> bool {
     let stderr = stderr.to_ascii_lowercase();
     [

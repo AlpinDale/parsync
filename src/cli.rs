@@ -1,7 +1,9 @@
+#[cfg(target_os = "linux")]
 use std::net::IpAddr;
 
 use clap::{ArgAction, Parser};
 
+#[cfg(target_os = "linux")]
 use crate::rdma::RdmaMode;
 
 #[derive(Debug, Clone, Parser)]
@@ -126,6 +128,7 @@ pub struct Cli {
     #[arg(long = "sftp-read-chunk-size")]
     pub sftp_read_chunk_size: Option<u64>,
 
+    #[cfg(target_os = "linux")]
     /// RDMA fast-path mode for SSH file transfers: auto, off, or require
     #[arg(
         long = "rdma",
@@ -136,18 +139,22 @@ pub struct Cli {
     )]
     pub rdma: Option<RdmaMode>,
 
+    #[cfg(target_os = "linux")]
     /// Disable the RDMA transfer fast path
     #[arg(long = "no-rdma", action = ArgAction::SetTrue, conflicts_with = "rdma")]
     pub no_rdma: bool,
 
+    #[cfg(target_os = "linux")]
     /// Local IPv4 address to advertise for incoming RDMA transfers
     #[arg(long = "rdma-bind")]
     pub rdma_bind: Option<IpAddr>,
 
+    #[cfg(target_os = "linux")]
     /// Minimum file size in bytes eligible for the RDMA fast path
     #[arg(long = "rdma-min-size")]
     pub rdma_min_size: Option<u64>,
 
+    #[cfg(target_os = "linux")]
     /// Remote RDMA helper command (default: parsync --internal-rdma-send)
     #[arg(long = "rdma-helper")]
     pub rdma_helper: Option<String>,
@@ -192,6 +199,7 @@ impl Cli {
 mod tests {
     use clap::Parser;
 
+    #[cfg(target_os = "linux")]
     use crate::rdma::RdmaMode;
 
     use super::Cli;
@@ -208,6 +216,7 @@ mod tests {
         assert!(cli.progress());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn parses_rdma_controls() {
         let cli = Cli::parse_from([

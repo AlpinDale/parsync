@@ -13,6 +13,7 @@ fn main() -> ExitCode {
             }
         };
     }
+    #[cfg(target_os = "linux")]
     if std::env::args().any(|arg| arg == "--internal-rdma-send") {
         return match parsync::rdma::run_send_stdio() {
             Ok(_) => ExitCode::SUCCESS,

@@ -1,12 +1,14 @@
-use std::{fs, net::IpAddr, path::PathBuf};
+use std::{fs, path::PathBuf};
+
+#[cfg(target_os = "linux")]
+use std::net::IpAddr;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use crate::{
-    cli::Cli,
-    rdma::{RdmaMode, DEFAULT_RDMA_MIN_SIZE},
-};
+use crate::cli::Cli;
+#[cfg(target_os = "linux")]
+use crate::rdma::{RdmaMode, DEFAULT_RDMA_MIN_SIZE};
 
 #[derive(Debug, Clone)]
 pub struct ResolvedConfig {
@@ -26,9 +28,13 @@ pub struct ResolvedConfig {
     pub verify_existing: bool,
     pub sftp_read_concurrency: usize,
     pub sftp_read_chunk_size: u64,
+    #[cfg(target_os = "linux")]
     pub rdma_mode: RdmaMode,
+    #[cfg(target_os = "linux")]
     pub rdma_bind: Option<IpAddr>,
+    #[cfg(target_os = "linux")]
     pub rdma_min_size: u64,
+    #[cfg(target_os = "linux")]
     pub rdma_helper: String,
     pub strict_windows_metadata: bool,
 }
@@ -51,9 +57,13 @@ struct FileConfig {
     verify_existing: Option<bool>,
     sftp_read_concurrency: Option<usize>,
     sftp_read_chunk_size: Option<u64>,
+    #[cfg(target_os = "linux")]
     rdma_mode: Option<RdmaMode>,
+    #[cfg(target_os = "linux")]
     rdma_bind: Option<IpAddr>,
+    #[cfg(target_os = "linux")]
     rdma_min_size: Option<u64>,
+    #[cfg(target_os = "linux")]
     rdma_helper: Option<String>,
     strict_windows_metadata: Option<bool>,
 }
@@ -167,6 +177,7 @@ impl ResolvedConfig {
             .or(file_cfg.sftp_read_chunk_size)
             .unwrap_or(4 * 1024 * 1024)
             .max(1);
+        #[cfg(target_os = "linux")]
         let rdma_mode = if cli.no_rdma {
             RdmaMode::Off
         } else {
@@ -175,15 +186,18 @@ impl ResolvedConfig {
                 .or(file_cfg.rdma_mode)
                 .unwrap_or(RdmaMode::Auto)
         };
+        #[cfg(target_os = "linux")]
         let rdma_bind = cli
             .rdma_bind
             .or_else(|| env_parse::<IpAddr>("PARSYNC_RDMA_BIND"))
             .or(file_cfg.rdma_bind);
+        #[cfg(target_os = "linux")]
         let rdma_min_size = cli
             .rdma_min_size
             .or_else(|| env_parse::<u64>("PARSYNC_RDMA_MIN_SIZE"))
             .or(file_cfg.rdma_min_size)
             .unwrap_or(DEFAULT_RDMA_MIN_SIZE);
+        #[cfg(target_os = "linux")]
         let rdma_helper = cli
             .rdma_helper
             .clone()
@@ -215,9 +229,13 @@ impl ResolvedConfig {
             verify_existing,
             sftp_read_concurrency,
             sftp_read_chunk_size,
+            #[cfg(target_os = "linux")]
             rdma_mode,
+            #[cfg(target_os = "linux")]
             rdma_bind,
+            #[cfg(target_os = "linux")]
             rdma_min_size,
+            #[cfg(target_os = "linux")]
             rdma_helper,
             strict_windows_metadata,
         })

@@ -21,15 +21,15 @@ use filetime::{set_file_mtime, FileTime};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
+#[cfg(target_os = "linux")]
+use crate::rdma::{
+    RdmaCopyResult, RdmaMode, RdmaTransferOptions, DEFAULT_RDMA_CHUNK_SIZE, DEFAULT_RDMA_TIMEOUT,
+};
 use crate::{
     cli::Cli,
     config::ResolvedConfig,
     delta::{apply_delta_ops, build_signature, choose_block_size, BlockSig},
     hashing::{format_digest, hash_file},
-    rdma::{
-        RdmaCopyResult, RdmaMode, RdmaTransferOptions, DEFAULT_RDMA_CHUNK_SIZE,
-        DEFAULT_RDMA_TIMEOUT,
-    },
     remote::{
         parse_source_spec, EntryKind, LocalFsRemote, RemoteClient, RemoteEntry, SourceSpec,
         SshRemote,
@@ -89,9 +89,13 @@ pub struct SyncOptions {
     pub verify_existing: bool,
     pub sftp_read_concurrency: usize,
     pub sftp_read_chunk_size: u64,
+    #[cfg(target_os = "linux")]
     pub rdma_mode: RdmaMode,
+    #[cfg(target_os = "linux")]
     pub rdma_bind: Option<std::net::IpAddr>,
+    #[cfg(target_os = "linux")]
     pub rdma_min_size: u64,
+    #[cfg(target_os = "linux")]
     pub rdma_helper: String,
     pub strict_windows_metadata: bool,
 }
@@ -128,9 +132,13 @@ impl SyncOptions {
             verify_existing: resolved.verify_existing,
             sftp_read_concurrency: resolved.sftp_read_concurrency,
             sftp_read_chunk_size: resolved.sftp_read_chunk_size,
+            #[cfg(target_os = "linux")]
             rdma_mode: resolved.rdma_mode,
+            #[cfg(target_os = "linux")]
             rdma_bind: resolved.rdma_bind,
+            #[cfg(target_os = "linux")]
             rdma_min_size: resolved.rdma_min_size,
+            #[cfg(target_os = "linux")]
             rdma_helper: resolved.rdma_helper,
             strict_windows_metadata: resolved.strict_windows_metadata,
         })
@@ -145,6 +153,7 @@ struct RuntimeWarnings {
     windows_owner_group: AtomicBool,
     windows_perms: AtomicBool,
     windows_symlink: AtomicBool,
+    #[cfg(target_os = "linux")]
     rdma_disabled: AtomicBool,
 }
 
@@ -176,25 +185,29 @@ struct PerfCounters {
 
 pub fn run_sync(cli: Cli) -> Result<RunSummary> {
     let options = SyncOptions::from_cli(&cli)?;
-    log_debug(
-        &options,
-        format!(
-            "starting sync source={} dest={} jobs={} chunk_size={} threshold={} resume={} strict_durability={} verify_existing={} sftp_read_concurrency={} sftp_read_chunk_size={} rdma={} rdma_min_size={} strict_windows_metadata={}",
-            cli.remote_source,
-            cli.local_destination.display(),
-            options.jobs,
-            options.chunk_size,
-            options.chunk_threshold,
-            options.resume,
-            options.strict_durability,
-            options.verify_existing,
-            options.sftp_read_concurrency,
-            options.sftp_read_chunk_size,
-            options.rdma_mode,
-            options.rdma_min_size,
-            options.strict_windows_metadata
-        ),
+    let start_message = format!(
+        "starting sync source={} dest={} jobs={} chunk_size={} threshold={} resume={} strict_durability={} verify_existing={} sftp_read_concurrency={} sftp_read_chunk_size={}",
+        cli.remote_source,
+        cli.local_destination.display(),
+        options.jobs,
+        options.chunk_size,
+        options.chunk_threshold,
+        options.resume,
+        options.strict_durability,
+        options.verify_existing,
+        options.sftp_read_concurrency,
+        options.sftp_read_chunk_size,
     );
+    #[cfg(target_os = "linux")]
+    let start_message = format!(
+        "{start_message} rdma={} rdma_min_size={}",
+        options.rdma_mode, options.rdma_min_size
+    );
+    let start_message = format!(
+        "{start_message} strict_windows_metadata={}",
+        options.strict_windows_metadata
+    );
+    log_debug(&options, start_message);
 
     match parse_source_spec(&cli.remote_source)? {
         SourceSpec::Local(spec) => {
@@ -626,8 +639,12 @@ fn transfer_one<R: RemoteClient + Sync>(
         fs::create_dir_all(parent)?;
     }
 
+    #[cfg(target_os = "linux")]
     let (rdma_outcome, rdma_fallbacked) =
         try_rdma_transfer(remote, job, options, state, ui, perf, warnings)?;
+    #[cfg(not(target_os = "linux"))]
+    let rdma_fallbacked = false;
+    #[cfg(target_os = "linux")]
     if let Some(outcome) = rdma_outcome {
         return Ok(outcome);
     }
@@ -894,6 +911,7 @@ fn transfer_one<R: RemoteClient + Sync>(
     bail!("unexpected transfer retry exhaustion")
 }
 
+#[cfg(target_os = "linux")]
 fn try_rdma_transfer<R: RemoteClient + Sync>(
     remote: &R,
     job: &FileJob,
@@ -2059,10 +2077,11 @@ mod tests {
     use anyhow::{anyhow, Result};
     use tempfile::TempDir;
 
+    #[cfg(target_os = "linux")]
+    use crate::rdma::{RdmaCopyResult, RdmaMode, RdmaTransferOptions};
     use crate::{
         cli::Cli,
         delta::protocol::{BlockSigWire, DeltaOp, DeltaPlan},
-        rdma::{RdmaCopyResult, RdmaMode, RdmaTransferOptions},
         remote::{EntryKind, RemoteClient, RemoteEntry, RemoteFileStat},
     };
 
@@ -2075,9 +2094,13 @@ mod tests {
         fail_once: Mutex<bool>,
         fail_on_reads: Mutex<BTreeSet<usize>>,
         read_counter: Mutex<usize>,
+        #[cfg(target_os = "linux")]
         rdma_enabled: bool,
+        #[cfg(target_os = "linux")]
         rdma_unavailable: bool,
+        #[cfg(target_os = "linux")]
         rdma_unavailable_cacheable: bool,
+        #[cfg(target_os = "linux")]
         rdma_counter: Mutex<usize>,
         stat_sequence: Mutex<Vec<RemoteFileStat>>,
     }
@@ -2090,9 +2113,13 @@ mod tests {
                 fail_once: Mutex::new(false),
                 fail_on_reads: Mutex::new(BTreeSet::new()),
                 read_counter: Mutex::new(0),
+                #[cfg(target_os = "linux")]
                 rdma_enabled: false,
+                #[cfg(target_os = "linux")]
                 rdma_unavailable: false,
+                #[cfg(target_os = "linux")]
                 rdma_unavailable_cacheable: false,
+                #[cfg(target_os = "linux")]
                 rdma_counter: Mutex::new(0),
                 stat_sequence: Mutex::new(Vec::new()),
             }
@@ -2113,17 +2140,20 @@ mod tests {
             self
         }
 
+        #[cfg(target_os = "linux")]
         fn with_rdma_enabled(mut self) -> Self {
             self.rdma_enabled = true;
             self
         }
 
+        #[cfg(target_os = "linux")]
         fn with_rdma_unavailable(mut self) -> Self {
             self.rdma_enabled = true;
             self.rdma_unavailable = true;
             self
         }
 
+        #[cfg(target_os = "linux")]
         fn with_cacheable_rdma_unavailable(mut self) -> Self {
             self.rdma_enabled = true;
             self.rdma_unavailable = true;
@@ -2210,10 +2240,12 @@ mod tests {
             })
         }
 
+        #[cfg(target_os = "linux")]
         fn supports_rdma_copy(&self) -> bool {
             self.rdma_enabled
         }
 
+        #[cfg(target_os = "linux")]
         fn try_rdma_copy(
             &self,
             relative_path: &Path,
@@ -2275,10 +2307,15 @@ mod tests {
             verify_existing: false,
             sftp_read_concurrency: Some(1),
             sftp_read_chunk_size: Some(4 * 1024 * 1024),
+            #[cfg(target_os = "linux")]
             rdma: None,
+            #[cfg(target_os = "linux")]
             no_rdma: false,
+            #[cfg(target_os = "linux")]
             rdma_bind: None,
+            #[cfg(target_os = "linux")]
             rdma_min_size: None,
+            #[cfg(target_os = "linux")]
             rdma_helper: None,
             strict_windows_metadata: false,
             remote_source: source,
@@ -2316,9 +2353,13 @@ mod tests {
             verify_existing: false,
             sftp_read_concurrency: 4,
             sftp_read_chunk_size: 4 * 1024 * 1024,
+            #[cfg(target_os = "linux")]
             rdma_mode: RdmaMode::Auto,
+            #[cfg(target_os = "linux")]
             rdma_bind: None,
+            #[cfg(target_os = "linux")]
             rdma_min_size: crate::rdma::DEFAULT_RDMA_MIN_SIZE,
+            #[cfg(target_os = "linux")]
             rdma_helper: "parsync --internal-rdma-send".to_string(),
             strict_windows_metadata: false,
         }
@@ -2467,6 +2508,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn rdma_transfer_path_is_used_when_required_and_available() {
         let dir = TempDir::new().expect("tmp");
@@ -2500,6 +2542,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn rdma_auto_falls_back_to_full_transfer_when_unavailable() {
         let dir = TempDir::new().expect("tmp");
@@ -2533,6 +2576,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn rdma_auto_caches_setup_unavailability_for_run() {
         let dir = TempDir::new().expect("tmp");

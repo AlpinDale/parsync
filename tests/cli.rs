@@ -14,6 +14,37 @@ fn help_contains_expected_flags() {
         .stdout(predicate::str::contains("-u, --update"));
 }
 
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn help_omits_rdma_flags() {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("parsync"));
+    cmd.arg("--help");
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("--rdma").not())
+        .stdout(predicate::str::contains("--no-rdma").not());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn rdma_flag_is_rejected() {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("parsync"));
+    cmd.args(["--rdma=require", "host:/src", "/tmp/dst"]);
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument '--rdma'"));
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn internal_rdma_helper_is_rejected() {
+    let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("parsync"));
+    cmd.arg("--internal-rdma-send");
+    cmd.assert().failure().stderr(predicate::str::contains(
+        "unexpected argument '--internal-rdma-send'",
+    ));
+}
+
 #[test]
 fn missing_local_source_fails() {
     let mut cmd = Command::new(assert_cmd::cargo::cargo_bin!("parsync"));

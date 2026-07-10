@@ -61,6 +61,8 @@ copies when RDMA devices and rdma-core `librdmacm` rsockets are available on
 both hosts. `parsync` opens a local RDMA receiver, starts
 `parsync --internal-rdma-send` on the source host over SSH, and falls back to
 the normal SFTP/chunk transfer if RDMA is not available.
+RDMA support, including its CLI controls and internal helper, is not built on
+Windows or other non-Linux platforms.
 
 The fast path can be tested without RDMA hardware by using the Linux RXE
 software RDMA driver (`rdma_rxe`) with rdma-core installed.
