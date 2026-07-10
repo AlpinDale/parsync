@@ -1,8 +1,8 @@
 # parsync
 
 `parsync` is a high-throughput, resumable sync tool for SSH remotes and
-local-to-local transfers, with parallel file transfers and optional block-delta
-sync.
+local-to-local transfers, with parallel file transfers, optional block-delta
+sync, and a Linux RDMA fast path when both hosts support it.
 
 ![demo](assets/demo.gif)
 
@@ -53,3 +53,37 @@ parsync -vrPlu user@example.com:2222:/remote/path /local/destination
 ```
 
 SSH config host aliases are supported.
+
+## RDMA fast path
+
+On Linux, SSH transfers can use a direct RDMA fast path for large whole-file
+copies when RDMA devices and rdma-core `librdmacm` rsockets are available on
+both hosts. `parsync` opens a local RDMA receiver, starts
+`parsync --internal-rdma-send` on the source host over SSH, and falls back to
+the normal SFTP/chunk transfer if RDMA is not available.
+RDMA support, including its CLI controls and internal helper, is not built on
+Windows or other non-Linux platforms.
+
+The fast path can be tested without RDMA hardware by using the Linux RXE
+software RDMA driver (`rdma_rxe`) with rdma-core installed.
+An ignored integration test wraps the VM validation:
+
+```bash
+cargo test --test rdma_rxe_vm -- --ignored
+```
+
+RDMA is enabled in `auto` mode by default for SSH sources and only applies to
+files at least 64 MiB. Useful controls:
+
+```bash
+parsync --rdma=require user@example.com:/remote/path /local/destination
+parsync --rdma=off user@example.com:/remote/path /local/destination
+parsync --rdma-bind 10.10.0.12 user@example.com:/remote/path /local/destination
+parsync --rdma-min-size 1048576 user@example.com:/remote/path /local/destination
+```
+
+Use `--rdma-bind` when the RDMA fabric uses a different local IPv4 address than
+the route selected for SSH. The same settings are available through
+`PARSYNC_RDMA`, `PARSYNC_RDMA_BIND`, `PARSYNC_RDMA_MIN_SIZE`, and
+`PARSYNC_RDMA_HELPER`, or the config file keys `rdma_mode`, `rdma_bind`,
+`rdma_min_size`, and `rdma_helper`.

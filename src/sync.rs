@@ -21,6 +21,10 @@ use filetime::{set_file_mtime, FileTime};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use rayon::prelude::*;
 
+#[cfg(target_os = "linux")]
+use crate::rdma::{
+    RdmaCopyResult, RdmaMode, RdmaTransferOptions, DEFAULT_RDMA_CHUNK_SIZE, DEFAULT_RDMA_TIMEOUT,
+};
 use crate::{
     cli::Cli,
     config::ResolvedConfig,
@@ -41,6 +45,9 @@ pub struct RunSummary {
     pub verbose: bool,
     pub delta_files: u64,
     pub delta_fallback_files: u64,
+    pub rdma_files: u64,
+    pub rdma_fallback_files: u64,
+    pub rdma_bytes: u64,
     pub bytes_saved: u64,
     pub listing_ms: u64,
     pub planning_ms: u64,
@@ -82,6 +89,14 @@ pub struct SyncOptions {
     pub verify_existing: bool,
     pub sftp_read_concurrency: usize,
     pub sftp_read_chunk_size: u64,
+    #[cfg(target_os = "linux")]
+    pub rdma_mode: RdmaMode,
+    #[cfg(target_os = "linux")]
+    pub rdma_bind: Option<std::net::IpAddr>,
+    #[cfg(target_os = "linux")]
+    pub rdma_min_size: u64,
+    #[cfg(target_os = "linux")]
+    pub rdma_helper: String,
     pub strict_windows_metadata: bool,
 }
 
@@ -117,6 +132,14 @@ impl SyncOptions {
             verify_existing: resolved.verify_existing,
             sftp_read_concurrency: resolved.sftp_read_concurrency,
             sftp_read_chunk_size: resolved.sftp_read_chunk_size,
+            #[cfg(target_os = "linux")]
+            rdma_mode: resolved.rdma_mode,
+            #[cfg(target_os = "linux")]
+            rdma_bind: resolved.rdma_bind,
+            #[cfg(target_os = "linux")]
+            rdma_min_size: resolved.rdma_min_size,
+            #[cfg(target_os = "linux")]
+            rdma_helper: resolved.rdma_helper,
             strict_windows_metadata: resolved.strict_windows_metadata,
         })
     }
@@ -130,6 +153,8 @@ struct RuntimeWarnings {
     windows_owner_group: AtomicBool,
     windows_perms: AtomicBool,
     windows_symlink: AtomicBool,
+    #[cfg(target_os = "linux")]
+    rdma_disabled: AtomicBool,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +168,9 @@ struct FileJob {
 struct TransferOutcome {
     used_delta: bool,
     delta_fallback: bool,
+    used_rdma: bool,
+    rdma_fallback: bool,
+    rdma_bytes: u64,
     bytes_saved: u64,
 }
 
@@ -157,23 +185,29 @@ struct PerfCounters {
 
 pub fn run_sync(cli: Cli) -> Result<RunSummary> {
     let options = SyncOptions::from_cli(&cli)?;
-    log_debug(
-        &options,
-        format!(
-            "starting sync source={} dest={} jobs={} chunk_size={} threshold={} resume={} strict_durability={} verify_existing={} sftp_read_concurrency={} sftp_read_chunk_size={} strict_windows_metadata={}",
-            cli.remote_source,
-            cli.local_destination.display(),
-            options.jobs,
-            options.chunk_size,
-            options.chunk_threshold,
-            options.resume,
-            options.strict_durability,
-            options.verify_existing,
-            options.sftp_read_concurrency,
-            options.sftp_read_chunk_size,
-            options.strict_windows_metadata
-        ),
+    let start_message = format!(
+        "starting sync source={} dest={} jobs={} chunk_size={} threshold={} resume={} strict_durability={} verify_existing={} sftp_read_concurrency={} sftp_read_chunk_size={}",
+        cli.remote_source,
+        cli.local_destination.display(),
+        options.jobs,
+        options.chunk_size,
+        options.chunk_threshold,
+        options.resume,
+        options.strict_durability,
+        options.verify_existing,
+        options.sftp_read_concurrency,
+        options.sftp_read_chunk_size,
     );
+    #[cfg(target_os = "linux")]
+    let start_message = format!(
+        "{start_message} rdma={} rdma_min_size={}",
+        options.rdma_mode, options.rdma_min_size
+    );
+    let start_message = format!(
+        "{start_message} strict_windows_metadata={}",
+        options.strict_windows_metadata
+    );
+    log_debug(&options, start_message);
 
     match parse_source_spec(&cli.remote_source)? {
         SourceSpec::Local(spec) => {
@@ -393,6 +427,9 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     let transferred_bytes = AtomicU64::new(0);
     let delta_files = AtomicU64::new(0);
     let delta_fallback_files = AtomicU64::new(0);
+    let rdma_files = AtomicU64::new(0);
+    let rdma_fallback_files = AtomicU64::new(0);
+    let rdma_bytes = AtomicU64::new(0);
     let bytes_saved = AtomicU64::new(0);
     let errors: Arc<Mutex<Vec<anyhow::Error>>> = Arc::new(Mutex::new(Vec::new()));
     let perf = Arc::new(PerfCounters::default());
@@ -435,9 +472,22 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
             if outcome.delta_fallback {
                 delta_fallback_files.fetch_add(1, Ordering::Relaxed);
             }
+            if outcome.used_rdma {
+                rdma_files.fetch_add(1, Ordering::Relaxed);
+                rdma_bytes.fetch_add(outcome.rdma_bytes, Ordering::Relaxed);
+            }
+            if outcome.rdma_fallback {
+                rdma_fallback_files.fetch_add(1, Ordering::Relaxed);
+            }
             ui.finish_file(
                 &job.entry.relative_path,
-                if outcome.used_delta { "delta" } else { "full" },
+                if outcome.used_rdma {
+                    "rdma"
+                } else if outcome.used_delta {
+                    "delta"
+                } else {
+                    "full"
+                },
             );
         });
     });
@@ -456,6 +506,9 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
         verbose: options.verbose,
         delta_files: delta_files.load(Ordering::Relaxed),
         delta_fallback_files: delta_fallback_files.load(Ordering::Relaxed),
+        rdma_files: rdma_files.load(Ordering::Relaxed),
+        rdma_fallback_files: rdma_fallback_files.load(Ordering::Relaxed),
+        rdma_bytes: rdma_bytes.load(Ordering::Relaxed),
         bytes_saved: bytes_saved.load(Ordering::Relaxed),
         listing_ms,
         planning_ms,
@@ -584,6 +637,16 @@ fn transfer_one<R: RemoteClient + Sync>(
     )?;
     if let Some(parent) = job.destination.parent() {
         fs::create_dir_all(parent)?;
+    }
+
+    #[cfg(target_os = "linux")]
+    let (rdma_outcome, rdma_fallbacked) =
+        try_rdma_transfer(remote, job, options, state, ui, perf, warnings)?;
+    #[cfg(not(target_os = "linux"))]
+    let rdma_fallbacked = false;
+    #[cfg(target_os = "linux")]
+    if let Some(outcome) = rdma_outcome {
+        return Ok(outcome);
     }
 
     if let Some(outcome) = try_fast_copy_transfer(remote, job, options, state, ui, perf, warnings)?
@@ -838,11 +901,222 @@ fn transfer_one<R: RemoteClient + Sync>(
         return Ok(TransferOutcome {
             used_delta: false,
             delta_fallback: delta_fallbacked,
+            used_rdma: false,
+            rdma_fallback: rdma_fallbacked,
+            rdma_bytes: 0,
             bytes_saved: 0,
         });
     }
 
     bail!("unexpected transfer retry exhaustion")
+}
+
+#[cfg(target_os = "linux")]
+fn try_rdma_transfer<R: RemoteClient + Sync>(
+    remote: &R,
+    job: &FileJob,
+    options: &SyncOptions,
+    state: &Arc<Mutex<StateStore>>,
+    ui: &Arc<TransferUi>,
+    perf: &Arc<PerfCounters>,
+    warnings: &Arc<RuntimeWarnings>,
+) -> Result<(Option<TransferOutcome>, bool)> {
+    if options.rdma_mode == RdmaMode::Off
+        || options.dry_run
+        || job.entry.kind != EntryKind::File
+        || job.entry.size < options.rdma_min_size
+        || warnings.rdma_disabled.load(Ordering::Relaxed)
+    {
+        return Ok((None, false));
+    }
+
+    let delta_candidate = options.delta_enabled
+        && job.entry.size >= options.delta_min_size
+        && job.destination.exists();
+    if delta_candidate && options.rdma_mode != RdmaMode::Require {
+        return Ok((None, false));
+    }
+
+    if !remote.supports_rdma_copy() {
+        if options.rdma_mode == RdmaMode::Require {
+            bail!("RDMA fast path is required but unsupported by this source type");
+        }
+        return Ok((None, false));
+    }
+
+    let part_path = {
+        let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+        locked.upsert_file(
+            &job.entry.relative_path,
+            job.entry.size,
+            job.entry.mtime_secs,
+            job.entry.size.max(1),
+        )?;
+        locked.save()?;
+        locked.part_path_for(&job.entry.relative_path)
+    };
+    let _ = fs::remove_file(&part_path);
+
+    let rdma_options = RdmaTransferOptions {
+        bind_addr: options.rdma_bind,
+        helper_command: options.rdma_helper.clone(),
+        chunk_size: DEFAULT_RDMA_CHUNK_SIZE,
+        timeout: DEFAULT_RDMA_TIMEOUT,
+    };
+
+    let started = Instant::now();
+    let result = remote.try_rdma_copy(
+        &job.entry.relative_path,
+        &part_path,
+        job.entry.size,
+        &rdma_options,
+    )?;
+    perf.transfer_read_ms
+        .fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+
+    let (bytes, chunks) = match result {
+        RdmaCopyResult::Copied { bytes, chunks } => (bytes, chunks),
+        RdmaCopyResult::Unavailable {
+            reason,
+            cache_for_run,
+        } => {
+            let _ = fs::remove_file(&part_path);
+            {
+                let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                locked.reset_progress(&job.entry.relative_path)?;
+                locked.save()?;
+            }
+            if options.rdma_mode == RdmaMode::Require {
+                bail!("RDMA fast path is required but unavailable: {reason}");
+            }
+            if cache_for_run {
+                warnings.rdma_disabled.store(true, Ordering::Relaxed);
+            }
+            vlog(
+                options,
+                format!(
+                    "RDMA unavailable for {}; falling back to full transfer: {}",
+                    job.entry.relative_path.display(),
+                    reason
+                ),
+            );
+            return Ok((None, true));
+        }
+    };
+
+    if bytes != job.entry.size {
+        let _ = fs::remove_file(&part_path);
+        {
+            let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+            locked.reset_progress(&job.entry.relative_path)?;
+            locked.save()?;
+        }
+        bail!(
+            "RDMA transfer byte count mismatch for {}: expected {}, got {}",
+            job.entry.relative_path.display(),
+            job.entry.size,
+            bytes
+        );
+    }
+
+    if options.strict_durability {
+        File::open(&part_path)
+            .with_context(|| format!("open RDMA partial: {}", part_path.display()))?
+            .sync_all()?;
+        let latest = remote.stat_file(&job.entry.relative_path)?;
+        if latest.size != job.entry.size || latest.mtime_secs != job.entry.mtime_secs {
+            let _ = fs::remove_file(&part_path);
+            {
+                let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+                locked.reset_progress(&job.entry.relative_path)?;
+                locked.save()?;
+            }
+            if options.rdma_mode == RdmaMode::Require {
+                bail!(
+                    "remote file changed during required RDMA transfer: {}",
+                    job.entry.relative_path.display()
+                );
+            }
+            vlog(
+                options,
+                format!(
+                    "remote file changed during RDMA transfer {}; falling back to full transfer",
+                    job.entry.relative_path.display()
+                ),
+            );
+            return Ok((None, true));
+        }
+    }
+
+    let finalize_started = Instant::now();
+    validate_destination_path(
+        &job.destination_root,
+        &job.entry.relative_path,
+        &job.entry.kind,
+    )?;
+    fs::rename(&part_path, &job.destination).with_context(|| {
+        format!(
+            "rename RDMA partial to destination: {} -> {}",
+            part_path.display(),
+            job.destination.display()
+        )
+    })?;
+    apply_mtime(&job.destination, job.entry.mtime_secs)?;
+    perf.transfer_finalize_ms.fetch_add(
+        finalize_started.elapsed().as_millis() as u64,
+        Ordering::Relaxed,
+    );
+
+    let metadata_started = Instant::now();
+    apply_metadata(
+        remote,
+        &job.entry.relative_path,
+        &job.destination,
+        &job.entry,
+        options,
+        warnings,
+    )?;
+    perf.metadata_ms.fetch_add(
+        metadata_started.elapsed().as_millis() as u64,
+        Ordering::Relaxed,
+    );
+
+    let state_started = Instant::now();
+    {
+        let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;
+        if options.verify_existing {
+            let digest = format_digest(hash_file(&job.destination)?);
+            locked.mark_finished_with_digest(&job.entry.relative_path, digest)?;
+        } else {
+            locked.mark_finished(&job.entry.relative_path)?;
+        }
+        locked.save()?;
+    }
+    perf.state_commit_ms.fetch_add(
+        state_started.elapsed().as_millis() as u64,
+        Ordering::Relaxed,
+    );
+    ui.inc_chunk_bytes(bytes);
+    vlog(
+        options,
+        format!(
+            "RDMA transfer complete: {} ({} chunks)",
+            job.entry.relative_path.display(),
+            chunks
+        ),
+    );
+
+    Ok((
+        Some(TransferOutcome {
+            used_delta: false,
+            delta_fallback: false,
+            used_rdma: true,
+            rdma_fallback: false,
+            rdma_bytes: bytes,
+            bytes_saved: 0,
+        }),
+        false,
+    ))
 }
 
 fn try_fast_copy_transfer<R: RemoteClient + Sync>(
@@ -935,6 +1209,9 @@ fn try_fast_copy_transfer<R: RemoteClient + Sync>(
     Ok(Some(TransferOutcome {
         used_delta: false,
         delta_fallback: false,
+        used_rdma: false,
+        rdma_fallback: false,
+        rdma_bytes: 0,
         bytes_saved: 0,
     }))
 }
@@ -1115,6 +1392,9 @@ fn transfer_one_delta<R: RemoteClient + Sync>(
     Ok(TransferOutcome {
         used_delta: true,
         delta_fallback: false,
+        used_rdma: false,
+        rdma_fallback: false,
+        rdma_bytes: 0,
         bytes_saved: plan.copy_bytes,
     })
 }
@@ -1797,6 +2077,8 @@ mod tests {
     use anyhow::{anyhow, Result};
     use tempfile::TempDir;
 
+    #[cfg(target_os = "linux")]
+    use crate::rdma::{RdmaCopyResult, RdmaMode, RdmaTransferOptions};
     use crate::{
         cli::Cli,
         delta::protocol::{BlockSigWire, DeltaOp, DeltaPlan},
@@ -1812,6 +2094,14 @@ mod tests {
         fail_once: Mutex<bool>,
         fail_on_reads: Mutex<BTreeSet<usize>>,
         read_counter: Mutex<usize>,
+        #[cfg(target_os = "linux")]
+        rdma_enabled: bool,
+        #[cfg(target_os = "linux")]
+        rdma_unavailable: bool,
+        #[cfg(target_os = "linux")]
+        rdma_unavailable_cacheable: bool,
+        #[cfg(target_os = "linux")]
+        rdma_counter: Mutex<usize>,
         stat_sequence: Mutex<Vec<RemoteFileStat>>,
     }
 
@@ -1823,6 +2113,14 @@ mod tests {
                 fail_once: Mutex::new(false),
                 fail_on_reads: Mutex::new(BTreeSet::new()),
                 read_counter: Mutex::new(0),
+                #[cfg(target_os = "linux")]
+                rdma_enabled: false,
+                #[cfg(target_os = "linux")]
+                rdma_unavailable: false,
+                #[cfg(target_os = "linux")]
+                rdma_unavailable_cacheable: false,
+                #[cfg(target_os = "linux")]
+                rdma_counter: Mutex::new(0),
                 stat_sequence: Mutex::new(Vec::new()),
             }
         }
@@ -1839,6 +2137,27 @@ mod tests {
 
         fn with_stat_sequence(self, stats: Vec<RemoteFileStat>) -> Self {
             *self.stat_sequence.lock().expect("lock") = stats;
+            self
+        }
+
+        #[cfg(target_os = "linux")]
+        fn with_rdma_enabled(mut self) -> Self {
+            self.rdma_enabled = true;
+            self
+        }
+
+        #[cfg(target_os = "linux")]
+        fn with_rdma_unavailable(mut self) -> Self {
+            self.rdma_enabled = true;
+            self.rdma_unavailable = true;
+            self
+        }
+
+        #[cfg(target_os = "linux")]
+        fn with_cacheable_rdma_unavailable(mut self) -> Self {
+            self.rdma_enabled = true;
+            self.rdma_unavailable = true;
+            self.rdma_unavailable_cacheable = true;
             self
         }
     }
@@ -1920,6 +2239,41 @@ mod tests {
                 source_mtime_secs,
             })
         }
+
+        #[cfg(target_os = "linux")]
+        fn supports_rdma_copy(&self) -> bool {
+            self.rdma_enabled
+        }
+
+        #[cfg(target_os = "linux")]
+        fn try_rdma_copy(
+            &self,
+            relative_path: &Path,
+            destination: &Path,
+            _source_size: u64,
+            _options: &RdmaTransferOptions,
+        ) -> Result<RdmaCopyResult> {
+            if !self.rdma_enabled {
+                return Ok(RdmaCopyResult::unavailable("mock RDMA disabled"));
+            }
+            *self.rdma_counter.lock().expect("lock") += 1;
+            if self.rdma_unavailable {
+                return Ok(if self.rdma_unavailable_cacheable {
+                    RdmaCopyResult::setup_unavailable("mock RDMA unavailable")
+                } else {
+                    RdmaCopyResult::unavailable("mock RDMA unavailable")
+                });
+            }
+            let data = self
+                .files
+                .get(relative_path)
+                .ok_or_else(|| anyhow!("missing file"))?;
+            fs::write(destination, data)?;
+            Ok(RdmaCopyResult::Copied {
+                bytes: data.len() as u64,
+                chunks: 1,
+            })
+        }
     }
 
     fn local_cli(source: String, destination: PathBuf) -> Cli {
@@ -1953,6 +2307,16 @@ mod tests {
             verify_existing: false,
             sftp_read_concurrency: Some(1),
             sftp_read_chunk_size: Some(4 * 1024 * 1024),
+            #[cfg(target_os = "linux")]
+            rdma: None,
+            #[cfg(target_os = "linux")]
+            no_rdma: false,
+            #[cfg(target_os = "linux")]
+            rdma_bind: None,
+            #[cfg(target_os = "linux")]
+            rdma_min_size: None,
+            #[cfg(target_os = "linux")]
+            rdma_helper: None,
             strict_windows_metadata: false,
             remote_source: source,
             local_destination: destination,
@@ -1989,6 +2353,14 @@ mod tests {
             verify_existing: false,
             sftp_read_concurrency: 4,
             sftp_read_chunk_size: 4 * 1024 * 1024,
+            #[cfg(target_os = "linux")]
+            rdma_mode: RdmaMode::Auto,
+            #[cfg(target_os = "linux")]
+            rdma_bind: None,
+            #[cfg(target_os = "linux")]
+            rdma_min_size: crate::rdma::DEFAULT_RDMA_MIN_SIZE,
+            #[cfg(target_os = "linux")]
+            rdma_helper: "parsync --internal-rdma-send".to_string(),
             strict_windows_metadata: false,
         }
     }
@@ -2133,6 +2505,125 @@ mod tests {
         assert_eq!(
             fs::read(dir.path().join("a.txt")).expect("read"),
             b"hello world"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rdma_transfer_path_is_used_when_required_and_available() {
+        let dir = TempDir::new().expect("tmp");
+        let entry = RemoteEntry {
+            relative_path: PathBuf::from("rdma.bin"),
+            kind: EntryKind::File,
+            size: 12,
+            mtime_secs: 1_700_000_000,
+            mode: 0o644,
+            uid: None,
+            gid: None,
+            link_target: None,
+        };
+        let mut files = BTreeMap::new();
+        files.insert(PathBuf::from("rdma.bin"), b"rdma payload".to_vec());
+        let remote = MockRemote::new(vec![entry], files).with_rdma_enabled();
+        let mut options = opts();
+        options.rdma_mode = RdmaMode::Require;
+        options.rdma_min_size = 1;
+
+        let summary = run_sync_with_client(&remote, dir.path(), &options).expect("sync");
+
+        assert_eq!(summary.transferred_files, 1);
+        assert_eq!(summary.rdma_files, 1);
+        assert_eq!(summary.rdma_bytes, 12);
+        assert_eq!(*remote.rdma_counter.lock().expect("lock"), 1);
+        assert_eq!(*remote.read_counter.lock().expect("lock"), 0);
+        assert_eq!(
+            fs::read(dir.path().join("rdma.bin")).expect("read"),
+            b"rdma payload"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rdma_auto_falls_back_to_full_transfer_when_unavailable() {
+        let dir = TempDir::new().expect("tmp");
+        let entry = RemoteEntry {
+            relative_path: PathBuf::from("fallback.bin"),
+            kind: EntryKind::File,
+            size: 8,
+            mtime_secs: 1_700_000_000,
+            mode: 0o644,
+            uid: None,
+            gid: None,
+            link_target: None,
+        };
+        let mut files = BTreeMap::new();
+        files.insert(PathBuf::from("fallback.bin"), b"fallback".to_vec());
+        let remote = MockRemote::new(vec![entry], files).with_rdma_unavailable();
+        let mut options = opts();
+        options.rdma_mode = RdmaMode::Auto;
+        options.rdma_min_size = 1;
+
+        let summary = run_sync_with_client(&remote, dir.path(), &options).expect("sync");
+
+        assert_eq!(summary.transferred_files, 1);
+        assert_eq!(summary.rdma_files, 0);
+        assert_eq!(summary.rdma_fallback_files, 1);
+        assert_eq!(*remote.rdma_counter.lock().expect("lock"), 1);
+        assert!(*remote.read_counter.lock().expect("lock") > 0);
+        assert_eq!(
+            fs::read(dir.path().join("fallback.bin")).expect("read"),
+            b"fallback"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rdma_auto_caches_setup_unavailability_for_run() {
+        let dir = TempDir::new().expect("tmp");
+        let entries = vec![
+            RemoteEntry {
+                relative_path: PathBuf::from("a.bin"),
+                kind: EntryKind::File,
+                size: 8,
+                mtime_secs: 1_700_000_000,
+                mode: 0o644,
+                uid: None,
+                gid: None,
+                link_target: None,
+            },
+            RemoteEntry {
+                relative_path: PathBuf::from("b.bin"),
+                kind: EntryKind::File,
+                size: 8,
+                mtime_secs: 1_700_000_001,
+                mode: 0o644,
+                uid: None,
+                gid: None,
+                link_target: None,
+            },
+        ];
+        let mut files = BTreeMap::new();
+        files.insert(PathBuf::from("a.bin"), b"aaaaaaaa".to_vec());
+        files.insert(PathBuf::from("b.bin"), b"bbbbbbbb".to_vec());
+        let remote = MockRemote::new(entries, files).with_cacheable_rdma_unavailable();
+        let mut options = opts();
+        options.jobs = 1;
+        options.rdma_mode = RdmaMode::Auto;
+        options.rdma_min_size = 1;
+
+        let summary = run_sync_with_client(&remote, dir.path(), &options).expect("sync");
+
+        assert_eq!(summary.transferred_files, 2);
+        assert_eq!(summary.rdma_files, 0);
+        assert_eq!(summary.rdma_fallback_files, 1);
+        assert_eq!(*remote.rdma_counter.lock().expect("lock"), 1);
+        assert_eq!(
+            fs::read(dir.path().join("a.bin")).expect("read"),
+            b"aaaaaaaa"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("b.bin")).expect("read"),
+            b"bbbbbbbb"
         );
     }
 

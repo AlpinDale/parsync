@@ -123,6 +123,14 @@ fn opts(jobs: usize) -> SyncOptions {
         verify_existing: false,
         sftp_read_concurrency: 4,
         sftp_read_chunk_size: 4 * 1024 * 1024,
+        #[cfg(target_os = "linux")]
+        rdma_mode: parsync::rdma::RdmaMode::Auto,
+        #[cfg(target_os = "linux")]
+        rdma_bind: None,
+        #[cfg(target_os = "linux")]
+        rdma_min_size: parsync::rdma::DEFAULT_RDMA_MIN_SIZE,
+        #[cfg(target_os = "linux")]
+        rdma_helper: "parsync --internal-rdma-send".to_string(),
         strict_windows_metadata: false,
     }
 }

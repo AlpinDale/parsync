@@ -12,6 +12,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
 };
+#[cfg(target_os = "linux")]
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+};
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -21,6 +26,8 @@ use crate::delta::{
     build_delta_ops,
     protocol::{BlockSigWire, DeltaPlan, HelperRequest, HelperResponse},
 };
+#[cfg(target_os = "linux")]
+use crate::rdma::{self, RdmaCopyResult, RdmaReceiver, RdmaSendReport, RdmaTransferOptions};
 
 const REMOTE_SPEC_FORMAT: &str = "remote must be in format [user@]host[:port]:path";
 
@@ -245,6 +252,24 @@ pub trait RemoteClient {
 
     fn try_fast_copy(&self, _relative_path: &Path, _destination: &Path) -> Result<bool> {
         Ok(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn supports_rdma_copy(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_rdma_copy(
+        &self,
+        _relative_path: &Path,
+        _destination: &Path,
+        _source_size: u64,
+        _options: &RdmaTransferOptions,
+    ) -> Result<RdmaCopyResult> {
+        Ok(RdmaCopyResult::unavailable(
+            "remote implementation does not support RDMA",
+        ))
     }
 }
 
@@ -909,6 +934,135 @@ impl RemoteClient for SshRemote {
             source_mtime_secs: resp.source_mtime_secs,
         })
     }
+
+    #[cfg(target_os = "linux")]
+    fn supports_rdma_copy(&self) -> bool {
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_rdma_copy(
+        &self,
+        relative_path: &Path,
+        destination: &Path,
+        source_size: u64,
+        options: &RdmaTransferOptions,
+    ) -> Result<RdmaCopyResult> {
+        #[cfg(target_os = "linux")]
+        {
+            let bind_addr =
+                match rdma::ipv4_bind_addr(options.bind_addr, &self.spec.host, self.spec.port) {
+                    Ok(addr) => addr,
+                    Err(err) => {
+                        return Ok(RdmaCopyResult::setup_unavailable(format!("{err:#}")));
+                    }
+                };
+
+            let receiver = match RdmaReceiver::bind(
+                bind_addr,
+                source_size,
+                options.chunk_size,
+                options.timeout,
+            ) {
+                Ok(receiver) => receiver,
+                Err(err) => {
+                    return Ok(RdmaCopyResult::setup_unavailable(format!("{err:#}")));
+                }
+            };
+
+            let source_path = self.remote_path_for(relative_path);
+            let request = rdma::new_send_request(
+                source_path.to_string_lossy().to_string(),
+                receiver.bind_addr(),
+                receiver.port(),
+                receiver.token(),
+                source_size,
+                options.chunk_size,
+            );
+            let payload = serde_json::to_vec(&request).context("serialize RDMA helper request")?;
+            let cancel = Arc::new(AtomicBool::new(false));
+            let receiver_cancel = Arc::clone(&cancel);
+            let destination = destination.to_path_buf();
+            let receiver_thread =
+                thread::spawn(move || receiver.receive_to_path(&destination, receiver_cancel));
+
+            let output_result = self.run_exec_with_input_output(&options.helper_command, &payload);
+            if output_result
+                .as_ref()
+                .map(|output| output.exit_status != 0)
+                .unwrap_or(true)
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+
+            let receive_result = receiver_thread
+                .join()
+                .map_err(|_| anyhow!("RDMA receiver thread panicked"))?;
+            let output = match output_result {
+                Ok(output) => output,
+                Err(err) => {
+                    return Ok(RdmaCopyResult::setup_unavailable(format!("{err:#}")));
+                }
+            };
+
+            if output.exit_status != 0 {
+                let reason = format!(
+                    "remote RDMA helper failed ({}): {}",
+                    output.exit_status,
+                    output.stderr.trim()
+                );
+                let cache_for_run = is_rdma_setup_failure(&output.stderr);
+                return Ok(RdmaCopyResult::Unavailable {
+                    reason,
+                    cache_for_run,
+                });
+            }
+
+            let received = match receive_result {
+                Ok(report) => report,
+                Err(err) => {
+                    return Ok(RdmaCopyResult::setup_unavailable(format!("{err:#}")));
+                }
+            };
+            let sent: RdmaSendReport = match serde_json::from_slice(&output.stdout) {
+                Ok(report) => report,
+                Err(err) => {
+                    return Ok(RdmaCopyResult::unavailable(format!(
+                        "parse RDMA helper report: {err}"
+                    )));
+                }
+            };
+            if sent.bytes_sent != received.bytes_received {
+                return Ok(RdmaCopyResult::unavailable(format!(
+                    "RDMA byte count mismatch: sender={} receiver={}",
+                    sent.bytes_sent, received.bytes_received
+                )));
+            }
+
+            Ok(RdmaCopyResult::Copied {
+                bytes: received.bytes_received,
+                chunks: received.chunks_received,
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_rdma_setup_failure(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    [
+        "rdma-core rsocket transport was not detected",
+        "load librdmacm",
+        "open rdma-core rsocket",
+        "bind rdma-core rsocket",
+        "listen on rdma-core rsocket",
+        "connect rdma rsocket",
+        "send rdma rsocket bytes",
+        "rdma rsocket send timed out",
+        "rdma rsocket connect timed out",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
 }
 
 #[derive(Debug, Clone)]

@@ -2,6 +2,8 @@ pub mod cli;
 pub mod config;
 pub mod delta;
 pub mod hashing;
+#[cfg(target_os = "linux")]
+pub mod rdma;
 pub mod remote;
 pub mod remote_helper;
 pub mod state;
