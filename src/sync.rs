@@ -57,6 +57,8 @@ pub struct RunSummary {
     pub metadata_ms: u64,
     pub state_commit_ms: u64,
     pub skipped_symlinks: u64,
+    pub deleted_files: u64,
+    pub deleted_dirs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +100,7 @@ pub struct SyncOptions {
     #[cfg(target_os = "linux")]
     pub rdma_helper: String,
     pub strict_windows_metadata: bool,
+    pub delete: bool,
 }
 
 impl SyncOptions {
@@ -141,6 +144,7 @@ impl SyncOptions {
             #[cfg(target_os = "linux")]
             rdma_helper: resolved.rdma_helper,
             strict_windows_metadata: resolved.strict_windows_metadata,
+            delete: cli.delete,
         })
     }
 }
@@ -303,6 +307,15 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
         locked.save()?;
     }
 
+    let allowed_normalized: HashSet<String> = if options.delete {
+        entries
+            .iter()
+            .map(|e| normalize_path_for_delete(&e.relative_path))
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
     let mut jobs = Vec::new();
     let mut dir_count = 0_u64;
     let mut symlink_count = 0_u64;
@@ -447,6 +460,10 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
                 return;
             }
             if options.dry_run {
+                log_status(
+                    options,
+                    format!("would transfer file: {}", job.entry.relative_path.display()),
+                );
                 transferred_files.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -499,6 +516,29 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
     drop(errs);
     ui.finish_all();
 
+    let (deleted_files, deleted_dirs) = if options.delete {
+        log_status(
+            options,
+            "stage=delete: removing extraneous paths on destination...",
+        );
+        let (files, dirs) =
+            delete_extraneous(local_destination, &state_root, &allowed_normalized, options)?;
+        if options.dry_run {
+            log_status(
+                options,
+                format!("stage=delete: would remove {} files, {} dirs", files, dirs),
+            );
+        } else {
+            log_status(
+                options,
+                format!("stage=delete: removed {} files, {} dirs", files, dirs),
+            );
+        }
+        (files, dirs)
+    } else {
+        (0, 0)
+    };
+
     let summary = RunSummary {
         transferred_files: transferred_files.load(Ordering::Relaxed),
         skipped_files: skipped,
@@ -518,6 +558,8 @@ pub fn run_sync_with_client<R: RemoteClient + Sync>(
         metadata_ms: perf.metadata_ms.load(Ordering::Relaxed),
         state_commit_ms: perf.state_commit_ms.load(Ordering::Relaxed),
         skipped_symlinks,
+        deleted_files,
+        deleted_dirs,
     };
     log_status(
         options,
@@ -566,6 +608,108 @@ fn remove_state_root_with_retry(path: &Path) -> io::Result<()> {
     {
         fs::remove_dir_all(path)
     }
+}
+
+/// Normalize path for delete-phase comparison (forward slashes, no trailing slash).
+fn normalize_path_for_delete(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// List all local entries under `local_destination`, skipping `state_root`. Returns (full_path, relative_path, is_dir).
+fn list_local_entries(
+    local_destination: &Path,
+    state_root: &Path,
+) -> Result<Vec<(PathBuf, PathBuf, bool)>> {
+    let mut out = Vec::new();
+    list_local_entries_recursive(local_destination, local_destination, state_root, &mut out)?;
+    Ok(out)
+}
+
+fn list_local_entries_recursive(
+    current: &Path,
+    local_destination: &Path,
+    state_root: &Path,
+    out: &mut Vec<(PathBuf, PathBuf, bool)>,
+) -> Result<()> {
+    let read_dir =
+        fs::read_dir(current).with_context(|| format!("read_dir: {}", current.display()))?;
+    for entry in read_dir {
+        let entry = entry.with_context(|| format!("read_dir entry: {}", current.display()))?;
+        let full_path = entry.path();
+        if full_path == state_root || full_path.starts_with(state_root) {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&full_path)
+            .with_context(|| format!("metadata: {}", full_path.display()))?;
+        let relative = full_path
+            .strip_prefix(local_destination)
+            .map_err(|_| {
+                anyhow!(
+                    "strip_prefix: {} not under {}",
+                    full_path.display(),
+                    local_destination.display()
+                )
+            })?
+            .to_path_buf();
+        let is_dir = meta.is_dir();
+        out.push((full_path.clone(), relative.clone(), is_dir));
+        if is_dir {
+            list_local_entries_recursive(&full_path, local_destination, state_root, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Delete local paths not in allowed set. Returns (deleted_files, deleted_dirs).
+fn delete_extraneous(
+    local_destination: &Path,
+    state_root: &Path,
+    allowed_normalized: &HashSet<String>,
+    options: &SyncOptions,
+) -> Result<(u64, u64)> {
+    let entries = list_local_entries(local_destination, state_root)?;
+    let mut to_delete_files: Vec<PathBuf> = Vec::new();
+    let mut to_delete_dirs: Vec<PathBuf> = Vec::new();
+    for (full_path, relative_path, is_dir) in entries {
+        let normalized = normalize_path_for_delete(&relative_path);
+        if allowed_normalized.contains(&normalized) {
+            continue;
+        }
+        if is_dir {
+            to_delete_dirs.push(full_path);
+        } else {
+            to_delete_files.push(full_path);
+        }
+    }
+    to_delete_dirs.sort_by_key(|b| std::cmp::Reverse(b.components().count()));
+    let mut deleted_files = 0_u64;
+    let mut deleted_dirs = 0_u64;
+    for path in &to_delete_files {
+        check_interrupted()?;
+        if options.dry_run {
+            log_status(options, format!("would delete: {}", path.display()));
+            deleted_files += 1;
+            continue;
+        }
+        log_status(options, format!("deleting file: {}", path.display()));
+        fs::remove_file(path).with_context(|| format!("delete file: {}", path.display()))?;
+        deleted_files += 1;
+    }
+    for path in &to_delete_dirs {
+        check_interrupted()?;
+        if options.dry_run {
+            log_status(options, format!("would delete dir: {}", path.display()));
+            deleted_dirs += 1;
+            continue;
+        }
+        log_status(options, format!("deleting dir: {}", path.display()));
+        fs::remove_dir_all(path).with_context(|| format!("delete dir: {}", path.display()))?;
+        deleted_dirs += 1;
+    }
+    Ok((deleted_files, deleted_dirs))
 }
 
 fn should_transfer(
@@ -2284,6 +2428,7 @@ mod tests {
             progress_partial: false,
             links: true,
             update: false,
+            delete: false,
             preserve_perms: false,
             preserve_owner: false,
             preserve_group: false,
@@ -2362,6 +2507,7 @@ mod tests {
             #[cfg(target_os = "linux")]
             rdma_helper: "parsync --internal-rdma-send".to_string(),
             strict_windows_metadata: false,
+            delete: false,
         }
     }
 
@@ -2625,6 +2771,41 @@ mod tests {
             fs::read(dir.path().join("b.bin")).expect("read"),
             b"bbbbbbbb"
         );
+    }
+
+    #[test]
+    fn delete_removes_extraneous_paths_on_destination() {
+        let dir = TempDir::new().expect("tmp");
+        let entry = RemoteEntry {
+            relative_path: PathBuf::from("a.txt"),
+            kind: EntryKind::File,
+            size: 5,
+            mtime_secs: 1700000000,
+            mode: 0o644,
+            uid: None,
+            gid: None,
+            link_target: None,
+        };
+        let mut files = BTreeMap::new();
+        files.insert(PathBuf::from("a.txt"), b"hello".to_vec());
+        let remote = MockRemote::new(vec![entry], files);
+        run_sync_with_client(&remote, dir.path(), &opts()).expect("sync");
+        assert!(dir.path().join("a.txt").exists());
+
+        let extra_file = dir.path().join("extra.txt");
+        let extra_dir = dir.path().join("extra_dir");
+        fs::write(&extra_file, b"junk").expect("write extra file");
+        fs::create_dir_all(&extra_dir).expect("create extra dir");
+        fs::write(extra_dir.join("nested.txt"), b"nested").expect("write nested");
+
+        let mut options = opts();
+        options.delete = true;
+        let summary = run_sync_with_client(&remote, dir.path(), &options).expect("sync");
+        assert_eq!(summary.deleted_files, 2);
+        assert_eq!(summary.deleted_dirs, 1);
+        assert!(dir.path().join("a.txt").exists());
+        assert!(!extra_file.exists());
+        assert!(!extra_dir.exists());
     }
 
     #[test]
