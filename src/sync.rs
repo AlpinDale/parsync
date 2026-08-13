@@ -862,7 +862,7 @@ fn transfer_one<R: RemoteClient + Sync>(
             &job.entry.relative_path,
             &job.entry.kind,
         )?;
-        fs::rename(&part_path, &job.destination).with_context(|| {
+        safe_rename(&part_path, &job.destination).with_context(|| {
             format!(
                 "rename partial to destination: {} -> {}",
                 part_path.display(),
@@ -1063,7 +1063,7 @@ fn try_rdma_transfer<R: RemoteClient + Sync>(
         &job.entry.relative_path,
         &job.entry.kind,
     )?;
-    fs::rename(&part_path, &job.destination).with_context(|| {
+    safe_rename(&part_path, &job.destination).with_context(|| {
         format!(
             "rename RDMA partial to destination: {} -> {}",
             part_path.display(),
@@ -1171,7 +1171,7 @@ fn try_fast_copy_transfer<R: RemoteClient + Sync>(
         &job.entry.relative_path,
         &job.entry.kind,
     )?;
-    fs::rename(&part_path, &job.destination).with_context(|| {
+    safe_rename(&part_path, &job.destination).with_context(|| {
         format!(
             "rename fast-copy partial to destination: {} -> {}",
             part_path.display(),
@@ -1353,7 +1353,7 @@ fn transfer_one_delta<R: RemoteClient + Sync>(
         &job.entry.relative_path,
         &job.entry.kind,
     )?;
-    fs::rename(&part_path, &job.destination).with_context(|| {
+    safe_rename(&part_path, &job.destination).with_context(|| {
         format!(
             "rename delta partial to destination: {} -> {}",
             part_path.display(),
@@ -2029,6 +2029,36 @@ fn create_or_replace_symlink(
         #[cfg(not(windows))]
         return Err(anyhow!("symlink creation is only supported on unix in v1"));
     }
+}
+
+/// Rename `from` into `to` without following a symlinked destination parent.
+#[cfg(unix)]
+fn safe_rename(from: &Path, to: &Path) -> Result<()> {
+    use nix::fcntl::{openat, renameat, OFlag, AT_FDCWD};
+    use nix::sys::stat::Mode;
+
+    let parent = to
+        .parent()
+        .ok_or_else(|| anyhow!("destination has no parent directory: {}", to.display()))?;
+    let name = to
+        .file_name()
+        .ok_or_else(|| anyhow!("destination has no file name: {}", to.display()))?;
+
+    let dir = openat(
+        AT_FDCWD,
+        parent,
+        OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .with_context(|| format!("open destination directory: {}", parent.display()))?;
+
+    renameat(AT_FDCWD, from, dir, name)
+        .with_context(|| format!("rename {} -> {}", from.display(), to.display()))
+}
+
+#[cfg(not(unix))]
+fn safe_rename(from: &Path, to: &Path) -> Result<()> {
+    fs::rename(from, to).with_context(|| format!("rename {} -> {}", from.display(), to.display()))
 }
 
 fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
