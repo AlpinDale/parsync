@@ -28,6 +28,16 @@ try {
     Write-Host "[parsync] downloading $downloadUrl"
     Invoke-WebRequest -Uri $downloadUrl -OutFile $zipPath -Headers $headers
 
+    $shaName = $assetName -replace '\.zip$', '.sha256'
+    $shaUrl = "https://github.com/$Repo/releases/download/$tag/$shaName"
+    Write-Host "[parsync] verifying checksum..."
+    Invoke-WebRequest -Uri $shaUrl -OutFile (Join-Path $tmpRoot $shaName) -Headers $headers
+    $expected = ((Get-Content (Join-Path $tmpRoot $shaName) -Raw) -split '\s+')[0].Trim().ToLower()
+    $actual = (Get-FileHash $zipPath -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $expected) {
+        throw "Checksum mismatch for $assetName (expected $expected, got $actual)"
+    }
+
     Expand-Archive -Path $zipPath -DestinationPath $tmpRoot -Force
     $srcExe = Join-Path $tmpRoot $BinName
     if (-not (Test-Path $srcExe)) {

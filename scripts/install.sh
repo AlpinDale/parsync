@@ -23,6 +23,17 @@ download() {
   fi
 }
 
+sha256() {
+  if have_cmd sha256sum; then
+    sha256sum "$1" | awk '{print $1}'
+  elif have_cmd shasum; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "error: need sha256sum or shasum to verify the download" >&2
+    exit 1
+  fi
+}
+
 read_latest_tag() {
   local json_file="$1"
   if have_cmd jq; then
@@ -89,6 +100,15 @@ archive="${tmpdir}/${asset}"
 
 echo "[parsync] downloading ${asset_url}"
 download "$asset_url" "$archive"
+
+checksum_file="${tmpdir}/checksum.sha256"
+download "${asset_url}.sha256" "$checksum_file"
+expected="$(awk '{print $1}' "$checksum_file")"
+actual="$(sha256 "$archive")"
+if [[ "${expected}" != "${actual}" ]]; then
+  echo "error: checksum mismatch for ${asset} (expected ${expected}, got ${actual})" >&2
+  exit 1
+fi
 
 tar -xzf "$archive" -C "$tmpdir"
 if [[ ! -f "${tmpdir}/${BIN_NAME}" ]]; then
