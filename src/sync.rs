@@ -1803,6 +1803,13 @@ fn apply_metadata<R: RemoteClient + Sync>(
 
         if options.preserve_xattrs {
             for (key, value) in remote.get_xattrs(relative_path)? {
+                if key.starts_with("security.") {
+                    vlog(
+                        options,
+                        format!("skipping security xattr {key} on {}", path.display()),
+                    );
+                    continue;
+                }
                 xattr::set(path, key, &value)
                     .with_context(|| format!("set xattr for {}", path.display()))?;
             }
