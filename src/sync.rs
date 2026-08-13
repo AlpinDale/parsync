@@ -687,6 +687,15 @@ fn transfer_one<R: RemoteClient + Sync>(
         } else {
             job.entry.size.max(1)
         };
+        let latest = remote.stat_file(&job.entry.relative_path)?;
+        if latest.size != job.entry.size {
+            bail!(
+                "remote file size changed before transfer: {} (expected {}, got {})",
+                job.entry.relative_path.display(),
+                job.entry.size,
+                latest.size
+            );
+        }
 
         let part_path = {
             let locked = state.lock().map_err(|_| anyhow!("state lock poisoned"))?;

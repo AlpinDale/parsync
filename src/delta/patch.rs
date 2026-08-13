@@ -2,7 +2,7 @@
 use std::io::Read;
 use std::{fs::File, io::Write, path::Path};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
 
 use super::protocol::DeltaOp;
@@ -19,14 +19,23 @@ pub fn apply_delta_ops(
     let mut out = File::create(output_path)
         .with_context(|| format!("open delta output: {}", output_path.display()))?;
     let mut written = 0_u64;
+    let basis_len = basis.metadata().context("stat basis file")?.len();
     let mut md5_ctx = md5::Context::new();
 
     for (idx, op) in ops.iter().enumerate().skip(start_op_index) {
         match op {
             DeltaOp::Copy { block_index, len } => {
-                let offset = (*block_index * block_size as u64) as usize;
+                let start = block_index
+                    .checked_mul(block_size as u64)
+                    .ok_or_else(|| anyhow!("delta copy offset overflow"))?;
+                let end = start
+                    .checked_add(*len as u64)
+                    .ok_or_else(|| anyhow!("delta copy range overflow"))?;
+                if end > basis_len {
+                    bail!("delta copy range exceeds basis file size");
+                }
                 let mut tmp = vec![0_u8; *len as usize];
-                read_exact_at(&mut basis, offset, &mut tmp)?;
+                read_exact_at(&mut basis, start as usize, &mut tmp)?;
                 out.write_all(&tmp)?;
                 md5_ctx.consume(&tmp);
                 written += *len as u64;
