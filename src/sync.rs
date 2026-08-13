@@ -1989,7 +1989,10 @@ fn create_or_replace_symlink(
         if existing.file_type().is_symlink() || existing.is_file() {
             fs::remove_file(link_path)?;
         } else if existing.is_dir() {
-            fs::remove_dir_all(link_path)?;
+            bail!(
+                "refusing to replace existing directory {} with a symlink",
+                link_path.display()
+            );
         }
     }
 
