@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -214,22 +214,12 @@ pub fn ipv4_bind_addr(
     }
 }
 
-pub fn random_token() -> [u8; 16] {
+pub fn random_token() -> Result<[u8; 16]> {
     let mut token = [0_u8; 16];
-    if fs::File::open("/dev/urandom")
+    fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut token))
-        .is_ok()
-    {
-        return token;
-    }
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let pid = std::process::id() as u128;
-    token.copy_from_slice(&(now ^ pid.rotate_left(17)).to_be_bytes());
-    token
+        .context("read /dev/urandom for RDMA token")?;
+    Ok(token)
 }
 
 fn has_entries(path: &Path) -> bool {
@@ -491,7 +481,7 @@ mod linux {
                 socket,
                 bind_addr,
                 port,
-                token: random_token(),
+                token: random_token()?,
                 expected_size,
                 chunk_size: chunk_size.max(1),
                 timeout,
