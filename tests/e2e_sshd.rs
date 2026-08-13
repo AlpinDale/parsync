@@ -53,9 +53,12 @@ fn parse_mapped_port(port_output: &str) -> Result<u16> {
 }
 
 fn run_parsync(remote: &str, destination: &Path) -> Result<()> {
+    let home = tempfile::tempdir().context("temp home")?;
     let output = Command::new(assert_cmd::cargo::cargo_bin!("parsync"))
         .args(["-vrPlu", remote, &destination.display().to_string()])
         .env("PARSYNC_SSH_PASSWORD", "pass")
+        .env("PARSYNC_ACCEPT_NEW_HOST_KEYS", "1")
+        .env("HOME", home.path())
         .output()
         .context("run parsync")?;
     if output.status.success() {

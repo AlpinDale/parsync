@@ -20,7 +20,9 @@ use std::{
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use ssh2::{File as SftpFile, FileStat, Session, Sftp};
+use ssh2::{
+    CheckResult, File as SftpFile, FileStat, KnownHostFileKind, KnownHostKeyFormat, Session, Sftp,
+};
 
 use crate::delta::{
     build_delta_ops,
@@ -1129,6 +1131,7 @@ impl Connection {
         // Bound blocking SSH/SFTP operations so Ctrl+C can be observed in outer loops.
         session.set_timeout(5_000);
         session.handshake().context("ssh handshake failed")?;
+        verify_host_key(&session, target)?;
 
         authenticate_session(&session, target)?;
         let sftp = session.sftp().context("create sftp session")?;
@@ -1315,6 +1318,60 @@ impl Drop for Connection {
         self.session.set_timeout(150);
         let _ = self.session.disconnect(None, "parsync shutdown", None);
     }
+}
+
+fn verify_host_key(session: &Session, target: &ConnectTarget) -> Result<()> {
+    let (key, key_type) = session
+        .host_key()
+        .ok_or_else(|| anyhow!("ssh server did not provide a host key"))?;
+
+    let known_hosts_path = known_hosts_path()?;
+    let mut known_hosts = session.known_hosts().context("init known hosts")?;
+    if known_hosts_path.exists() {
+        known_hosts
+            .read_file(&known_hosts_path, KnownHostFileKind::OpenSSH)
+            .context("read known_hosts")?;
+    }
+
+    let host_label = if target.port == 22 {
+        target.host.clone()
+    } else {
+        format!("[{}]:{}", target.host, target.port)
+    };
+
+    match known_hosts.check_port(&target.host, target.port, key) {
+        CheckResult::Match => Ok(()),
+        CheckResult::Mismatch => bail!(
+            "ssh host key mismatch for {host_label}: server key does not match known_hosts (possible man-in-the-middle attack)"
+        ),
+        CheckResult::NotFound => {
+            if std::env::var("PARSYNC_ACCEPT_NEW_HOST_KEYS").is_ok_and(|v| v != "0") {
+                if let Some(parent) = known_hosts_path.parent() {
+                    fs::create_dir_all(parent).context("create ~/.ssh")?;
+                }
+                known_hosts
+                    .add(&host_label, key, "", KnownHostKeyFormat::from(key_type))
+                    .context("add host key to known_hosts")?;
+                known_hosts
+                    .write_file(&known_hosts_path, KnownHostFileKind::OpenSSH)
+                    .context("write known_hosts")?;
+                Ok(())
+            } else {
+                bail!(
+                    "ssh host key for {host_label} is not in known_hosts ({}). Add it with `ssh-keyscan -p {} {} >> ~/.ssh/known_hosts`, or set PARSYNC_ACCEPT_NEW_HOST_KEYS=1 to accept it",
+                    known_hosts_path.display(),
+                    target.port,
+                    target.host
+                )
+            }
+        }
+        CheckResult::Failure => bail!("failed to verify ssh host key for {host_label}"),
+    }
+}
+
+fn known_hosts_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME").context("HOME is required to verify ssh host keys")?;
+    Ok(PathBuf::from(home).join(".ssh/known_hosts"))
 }
 
 fn authenticate_session(session: &Session, target: &ConnectTarget) -> Result<()> {
